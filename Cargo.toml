@@ -1,0 +1,15 @@
+[package]
+name = "rsfs"
+version = "0.1.0"
+authors = ["Travis Bischel <travis.bischel@gmail.com>"]
+description = "A generic filesystem with implementation for normal (disk), in memory, and test work sets."
+documentation = "https://docs.rs/rsfs"
+homepage = "https://docs.rs/rsfs"
+repository = "https://github.com/twmb/rsfs"
+readme = "README.md"
+keywords = ["filesystem", "fs", "memory", "testing", "test"]
+categories = ["development-tools::testing", "development-tools"]
+license = "MIT"
+
+[dependencies]
+parking_lot = "0.4"
