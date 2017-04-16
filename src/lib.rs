@@ -29,5 +29,6 @@
 mod fs;
 
 pub mod rs;
+pub mod path_parts;
 
 pub use fs::*;
