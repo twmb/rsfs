@@ -56,6 +56,7 @@
 extern crate parking_lot;
 
 use self::parking_lot::{Mutex, RwLock};
+use super::errors::*;
 use super::fs;
 use super::path_parts::{self, IteratorExt, Part};
 
@@ -72,56 +73,6 @@ use std::vec::IntoIter;
 
 // TODO this filesystem ignores prefixes.
 // File could be tested more, maybe, but the raw_file seems sufficient.
-
-// Used when a file or directory does not exist.
-#[allow(non_snake_case)]
-fn ENOENT() -> Error {
-    Error::from_raw_os_error(2)
-}
-
-// Used when performing an operation with a file that was not opened in a way to allow that
-// operation (read on a write only open, etc).
-#[allow(non_snake_case)]
-fn EBADF() -> Error {
-    Error::from_raw_os_error(9)
-}
-
-// Used when a user does not have requisite permissions.
-#[allow(non_snake_case)]
-fn EACCES() -> Error {
-    Error::from_raw_os_error(13)
-}
-
-// Used when a file or directory does not exist.
-#[allow(non_snake_case)]
-fn EEXIST() -> Error {
-    Error::from_raw_os_error(17)
-}
-
-// Used when attempting to perform a directory operation on a file.
-#[allow(non_snake_case)]
-fn ENOTDIR() -> Error {
-    Error::from_raw_os_error(20)
-}
-
-// Used when attempting to perform a file operation on a directory.
-#[allow(non_snake_case)]
-fn EISDIR() -> Error {
-    Error::from_raw_os_error(21)
-}
-
-// Used when performing an invalid operation (aka, a bad OpenOptions combination).
-#[allow(non_snake_case)]
-fn EINVAL() -> Error {
-    Error::from_raw_os_error(22)
-}
-
-// Used when an operation needs an empty directory and is performed on a non-empty directory.
-#[allow(non_snake_case)]
-fn ENOTEMPTY() -> Error {
-    // TODO Windows is 41, other Unix / BSD distros differ from 39.
-    Error::from_raw_os_error(39)
-}
 
 // Differentiates between a directory and a file.
 #[derive(Copy, Clone, Debug, PartialEq)]

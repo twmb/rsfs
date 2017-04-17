@@ -30,6 +30,7 @@ mod fs;
 
 pub mod rs;
 pub mod mem;
+pub mod errors;
 pub mod path_parts;
 
 pub use fs::*;
