@@ -60,15 +60,13 @@ use super::errors::*;
 use super::fs;
 use super::path_parts::{self, IteratorExt, Part};
 
-use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::OsString;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::vec::IntoIter;
 
 // TODO this filesystem ignores prefixes.
@@ -397,7 +395,7 @@ impl ReadDir {
         let children = dir.children.as_ref().ok_or_else(ENOTDIR)?;
         let mut dirents = Vec::new();
         for (base, dirent) in children.iter() {
-            let dirent = dirent.borrow();
+            let dirent = dirent.read();
             dirents.push(DirEntry {
                 dir: PathBuf::from(path.as_ref()),
                 base: base.clone(),
@@ -451,30 +449,6 @@ pub struct FS {
     inner: Arc<Mutex<FileSystem>>,
 }
 
-// We have a dilemma. Recursive data structures require either unsafe code or Rc/RefCell. I chose
-// the latter. It seemed easy enough.
-//
-// Now we want to share that recursive data structure across threads. Rc/RefCell are not safe to
-// send around. There is a good reason for that, too: we cannot have an Rc cloned in one thread
-// stay around when a different thread can access the Rc.
-//
-// We could make the recursive data structure use Arc/RwLock, but seriously at that point unsafe
-// code becomes appealing. There is a reason cyclic data structures in the stdlib use unsafe.
-//
-// But what if we surrounded the Rc with a Mutex and guaranteed that no usable clones of that Rc
-// would live outside the Mutex, then we wrap that Mutex with an Arc?
-//
-// If we guarantee that, _technically_ our usage of Rc would be safe. Rc is not Send, but if we say
-// FS is Send and Sync, we can use FS across thread.
-//
-// The contract this code must guarantee is that no Rc lives outside of a FileSystem function call.
-// Easily enough, the only reason for Rc is so we can traverse a filesystem easily (our traversal
-// repeatedly clones and drops).
-//
-// While the following two lines are mildly regrettable, I do not think they are unreasonable.
-unsafe impl Send for FS {}
-unsafe impl Sync for FS {}
-
 impl FS {
     /// Creates an empty `FS` with mode `0o775`.
     pub fn new() -> FS {
@@ -483,7 +457,7 @@ impl FS {
 
     /// Creates an empty `FS` with the given mode.
     pub fn with_mode(mode: u32) -> FS {
-        let pwd = Rc::new(RefCell::new(Directory {
+        let pwd = Arc::new(RwLock::new(Directory {
             mode: mode,
             file: None,
             parent: Weak::new(),
@@ -599,8 +573,8 @@ struct Directory {
 
     file: Option<Arc<RwLock<RawFile>>>,
 
-    parent: Weak<RefCell<Directory>>,
-    children: Option<HashMap<OsString, Rc<RefCell<Directory>>>>,
+    parent: Weak<RwLock<Directory>>,
+    children: Option<HashMap<OsString, Arc<RwLock<Directory>>>>,
 }
 
 impl Directory {
@@ -621,8 +595,8 @@ impl Directory {
 // FileSystem is a single in-memory filesystem that can be used cloned and passed around safely.
 #[derive(Debug)]
 struct FileSystem {
-    root: Rc<RefCell<Directory>>,
-    pwd: Rc<RefCell<Directory>>,
+    root: Arc<RwLock<Directory>>,
+    pwd: Arc<RwLock<Directory>>,
 }
 
 fn path_empty<P: AsRef<Path>>(path: P) -> bool {
@@ -633,9 +607,9 @@ fn path_empty<P: AsRef<Path>>(path: P) -> bool {
 // currently does not validate file contents.
 impl PartialEq for FileSystem {
     fn eq(&self, other: &FileSystem) -> bool {
-        fn eq_at(l: Rc<RefCell<Directory>>, r: Rc<RefCell<Directory>>) -> bool {
-            let bl = l.borrow();
-            let br = r.borrow();
+        fn eq_at(l: Arc<RwLock<Directory>>, r: Arc<RwLock<Directory>>) -> bool {
+            let bl = l.read();
+            let br = r.read();
             if bl.mode != br.mode {
                 return false;
             }
@@ -673,13 +647,13 @@ impl FileSystem {
     // (exec) the parent directory.
     fn up_path(&self,
                parts: path_parts::Parts)
-               -> Result<(Rc<RefCell<Directory>>, path_parts::Parts)> {
+               -> Result<(Arc<RwLock<Directory>>, path_parts::Parts)> {
         // If the parts begin at root, they will have no ParentDirs. We go up and return at root.
         if parts.at_root() {
             return Ok((self.root.clone(), parts));
         }
 
-        // `up` is what we return: the Rc<Directory> after traversing up all ParentDirs in `parts`.
+        // `up` is what we return: the Arc<Directory> after traversing up all ParentDirs in `parts`.
         let mut up = self.pwd.clone();
         let mut parts_iter = parts.into_iter().peekable();
         while parts_iter.peek()
@@ -691,10 +665,10 @@ impl FileSystem {
             .is_some() {
             parts_iter.next();
             if let Some(parent) = {
-                let up = up.borrow();
+                let up = up.read();
                 up.parent.upgrade().as_ref().cloned()
             } {
-                if !parent.borrow().executable() {
+                if !parent.read().executable() {
                     return Err(EACCES());
                 }
                 up = parent;
@@ -713,23 +687,23 @@ impl FileSystem {
     // a directory).
     fn traverse(&self,
                 parts: path_parts::Parts)
-                -> Result<(Rc<RefCell<Directory>>, Option<OsString>)> {
+                -> Result<(Arc<RwLock<Directory>>, Option<OsString>)> {
         let (mut fs, parts) = self.up_path(parts)?;
         let mut parts_iter = parts.into_iter().peek2able();
         while parts_iter.peek2().is_some() {
-            if !fs.borrow().executable() {
+            if !fs.read().executable() {
                 return Err(EACCES());
             }
 
             fs = {
-                let fs = fs.borrow();
+                let fs = fs.read();
                 let children = fs.children.as_ref().ok_or_else(ENOTDIR)?;
                 children.get(parts_iter.next().unwrap().as_normal().unwrap())
                     .cloned()
                     .ok_or_else(ENOENT)?
             };
         }
-        if !fs.borrow().is_dir() {
+        if !fs.read().is_dir() {
             return Err(ENOTDIR());
         }
 
@@ -752,7 +726,7 @@ impl FileSystem {
                 }
             }
         };
-        let borrow = fs.borrow();
+        let borrow = fs.read();
         match borrow.children.as_ref().unwrap().get(&base) {
             Some(child) => {
                 self.pwd = child.clone();
@@ -770,15 +744,15 @@ impl FileSystem {
                 if path_empty(&path) {
                     return Err(ENOENT());
                 } else {
-                    fs.borrow_mut().mode = mode;
+                    fs.write().mode = mode;
                     return Ok(());
                 }
             }
         };
-        let borrow = fs.borrow_mut();
+        let borrow = fs.write();
         match borrow.children.as_ref().unwrap().get(&base) {
             Some(child) => {
-                child.borrow_mut().mode = mode;
+                child.write().mode = mode;
                 Ok(())
             }
             None => Err(ENOENT()),
@@ -801,23 +775,23 @@ impl FileSystem {
             }
         };
 
-        if !fs.borrow().executable() || !fs.borrow().writable() {
+        if !fs.read().executable() || !fs.read().writable() {
             return Err(EACCES());
         }
 
-        let mut borrow = fs.borrow_mut();
+        let mut borrow = fs.write();
         match borrow.children.as_mut().unwrap().entry(base) {
             Entry::Occupied(o) => {
-                if can_exist && o.get().borrow().is_dir() {
+                if can_exist && o.get().read().is_dir() {
                     return Ok(());
                 }
                 Err(EEXIST())
             }
             Entry::Vacant(v) => {
-                v.insert(Rc::new(RefCell::new(Directory {
+                v.insert(Arc::new(RwLock::new(Directory {
                     mode: mode,
                     file: None,
-                    parent: Rc::downgrade(&fs),
+                    parent: Arc::downgrade(&fs),
                     children: Some(HashMap::new()),
                 })));
                 Ok(())
@@ -845,7 +819,7 @@ impl FileSystem {
     // (search) permission is required on all of the directories in pathname that lead to the file.
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
-        let fs = fs.borrow();
+        let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
             None => {
@@ -867,7 +841,7 @@ impl FileSystem {
 
         match fs.children.as_ref().unwrap().get(&base) {
             Some(child) => {
-                let child = child.borrow();
+                let child = child.read();
                 Ok(|| -> Metadata {
                     if child.is_dir() {
                         Metadata {
@@ -891,7 +865,7 @@ impl FileSystem {
 
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
-        let fs = fs.borrow();
+        let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
             None => {
@@ -904,7 +878,7 @@ impl FileSystem {
         };
 
         match fs.children.as_ref().unwrap().get(&base) {
-            Some(child) => ReadDir::new(&path, &*child.borrow()),
+            Some(child) => ReadDir::new(&path, &*child.read()),
             None => Err(ENOENT()),
         }
     }
@@ -917,34 +891,34 @@ impl FileSystem {
                 EACCES()
             })?;
 
-        if !fs.borrow().executable() || !fs.borrow().writable() {
+        if !fs.read().executable() || !fs.read().writable() {
             return Err(EACCES());
         }
 
         // We need to make sure that the FileType being requested for removal matches the FileType
         // of the directory. Scope this check to let the non mutable borrow drop before removing.
         {
-            let child = fs.borrow();
+            let child = fs.read();
             let child = child.children.as_ref().unwrap().get(&base).ok_or_else(ENOENT)?;
 
             match kind {
                 FileType::File => {
-                    if child.borrow().is_dir() {
+                    if child.read().is_dir() {
                         return Err(EISDIR());
                     }
                 }
                 FileType::Dir => {
-                    if !child.borrow().is_dir() {
+                    if !child.read().is_dir() {
                         return Err(ENOTDIR());
                     }
-                    if !child.borrow().children.as_ref().unwrap().is_empty() {
+                    if !child.read().children.as_ref().unwrap().is_empty() {
                         return Err(ENOTEMPTY());
                     }
                 }
             }
         }
 
-        fs.borrow_mut().children.as_mut().unwrap().remove(&base);
+        fs.write().children.as_mut().unwrap().remove(&base);
         Ok(())
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -959,9 +933,9 @@ impl FileSystem {
         // read_dir to recurse, which requires `ls`. Standard linux is able to remove empty
         // directories with only write and execute privileges. This code attempts to mimic what
         // Rust will do.
-        fn recursive_remove(fs: Rc<RefCell<Directory>>) -> Result<()> {
-            if fs.borrow().children.is_some() {
-                let mut borrow = fs.borrow_mut();
+        fn recursive_remove(fs: Arc<RwLock<Directory>>) -> Result<()> {
+            if fs.read().children.is_some() {
+                let mut borrow = fs.write();
                 if !borrow.readable() || !borrow.executable() || !borrow.writable() {
                     return Err(EACCES());
                 }
@@ -992,7 +966,7 @@ impl FileSystem {
                 }
                 res?
             } else {
-                fs.borrow_mut().file.as_mut().map(|f| f.write().invalidate());
+                fs.write().file.as_mut().map(|f| f.write().invalidate());
             }
             Ok(())
         }
@@ -1000,7 +974,7 @@ impl FileSystem {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let child = match may_base {
             Some(ref base) => {
-                let fs = fs.borrow();
+                let fs = fs.read();
                 if !fs.executable() || !fs.writable() {
                     return Err(EACCES());
                 }
@@ -1021,7 +995,7 @@ impl FileSystem {
         recursive_remove(child)?;
 
         if let Some(ref base) = may_base {
-            fs.borrow_mut().children.as_mut().unwrap().remove(base);
+            fs.write().children.as_mut().unwrap().remove(base);
         }
         Ok(())
     }
@@ -1037,29 +1011,29 @@ impl FileSystem {
         let new_base =
             new_may_base.ok_or_else(|| if path_empty(&to) { ENOENT() } else { EEXIST() })?;
 
-        if Rc::ptr_eq(&old_fs, &new_fs) && old_base == new_base {
+        if Arc::ptr_eq(&old_fs, &new_fs) && old_base == new_base {
             return Ok(());
         }
 
-        if !old_fs.borrow().executable() || !old_fs.borrow().writable() {
+        if !old_fs.read().executable() || !old_fs.read().writable() {
             return Err(EACCES());
         }
-        if !new_fs.borrow().executable() || !new_fs.borrow().writable() {
+        if !new_fs.read().executable() || !new_fs.read().writable() {
             return Err(EACCES());
         }
 
         // Rust's rename is strong, but also annoying, in that it can rename a directory to a
         // directory if that directory is empty. We could make the code elegant, but this will do.
         let (old_exist, old_is_dir) =
-            match old_fs.borrow().children.as_ref().unwrap().get(&old_base) {
-                Some(child) => (true, child.borrow().is_dir()),
+            match old_fs.read().children.as_ref().unwrap().get(&old_base) {
+                Some(child) => (true, child.read().is_dir()),
                 None => (false, false),
             };
 
         let (new_exist, new_is_dir, new_is_empty) =
-            match new_fs.borrow().children.as_ref().unwrap().get(&new_base) {
+            match new_fs.read().children.as_ref().unwrap().get(&new_base) {
                 Some(child) => {
-                    match child.borrow().children {
+                    match child.read().children {
                         Some(ref children) => (true, true, children.is_empty()),
                         None => (true, false, false),
                     }
@@ -1085,8 +1059,8 @@ impl FileSystem {
             }
         }
 
-        let removed = old_fs.borrow_mut().children.as_mut().unwrap().remove(&old_base).unwrap();
-        new_fs.borrow_mut().children.as_mut().unwrap().insert(new_base, removed);
+        let removed = old_fs.write().children.as_mut().unwrap().remove(&old_base).unwrap();
+        new_fs.write().children.as_mut().unwrap().insert(new_base, removed);
         Ok(())
     }
 
@@ -1123,15 +1097,15 @@ impl FileSystem {
                 }
             }
         };
-        if !fs.borrow().executable() {
+        if !fs.read().executable() {
             return Err(EACCES());
         }
-        if let Some(child) = fs.borrow().children.as_ref().unwrap().get(&base) {
+        if let Some(child) = fs.read().children.as_ref().unwrap().get(&base) {
             return open_existing(child, &options);
         }
 
         // From here down, we worry about creating a new file.
-        if !fs.borrow().writable() {
+        if !fs.read().writable() {
             return Err(EACCES());
         }
         if !options.create {
@@ -1141,13 +1115,13 @@ impl FileSystem {
             valid: true,
             data: Vec::new(),
         }));
-        let child = Rc::new(RefCell::new(Directory {
+        let child = Arc::new(RwLock::new(Directory {
             mode: options.mode,
             file: Some(file.clone()),
-            parent: Rc::downgrade(&fs),
+            parent: Arc::downgrade(&fs),
             children: None,
         }));
-        fs.borrow_mut().children.as_mut().unwrap().insert(base, child);
+        fs.write().children.as_mut().unwrap().insert(base, child);
         Ok(File {
             read: options.read,
             write: options.write,
@@ -1165,12 +1139,12 @@ impl FileSystem {
 
 // `open_existing` opens known existing file with the given options, returning an error if the file
 // cannot be opened with those options.
-fn open_existing(fs: &Rc<RefCell<Directory>>, options: &OpenOptions) -> Result<File> {
+fn open_existing(fs: &Arc<RwLock<Directory>>, options: &OpenOptions) -> Result<File> {
     if options.excl {
         return Err(EEXIST());
     }
 
-    let fs = fs.borrow();
+    let fs = fs.read();
     if fs.is_dir() {
         if options.write {
             return Err(EISDIR());
@@ -1237,7 +1211,7 @@ mod test {
 
     #[test]
     fn equal() {
-        let exp_pwd = Rc::new(RefCell::new(Directory {
+        let exp_pwd = Arc::new(RwLock::new(Directory {
             mode: 0o0,
             file: None,
             parent: Weak::new(),
@@ -1252,15 +1226,15 @@ mod test {
         };
         {
             let ref mut root = exp.inner.lock().pwd;
-            root.borrow_mut()
+            root.write()
                 .children
                 .as_mut()
                 .unwrap()
                 .insert(OsString::from("lolz"),
-                        Rc::new(RefCell::new(Directory {
+                        Arc::new(RwLock::new(Directory {
                             mode: 0o666,
                             file: None,
-                            parent: Rc::downgrade(&root),
+                            parent: Arc::downgrade(&root),
                             children: Some(HashMap::new()),
                         })));
         }
@@ -1273,7 +1247,7 @@ mod test {
 
     #[test]
     fn mkdir() {
-        let exp_pwd = Rc::new(RefCell::new(Directory {
+        let exp_pwd = Arc::new(RwLock::new(Directory {
             mode: 0o300,
             file: None,
             parent: Weak::new(),
@@ -1288,36 +1262,36 @@ mod test {
 
         {
             let ref mut root = exp.inner.lock().pwd;
-            let mut borrow = root.borrow_mut();
+            let mut borrow = root.write();
             let children = borrow.children.as_mut().unwrap();
             children.insert(OsString::from("a"),
-                            Rc::new(RefCell::new(Directory {
+                            Arc::new(RwLock::new(Directory {
                                 mode: 0o500, // r-x: cannot create subfiles
                                 file: None,
-                                parent: Rc::downgrade(&root),
+                                parent: Arc::downgrade(&root),
                                 children: Some(HashMap::new()),
                             })));
             children.insert(OsString::from("b"),
-                            Rc::new(RefCell::new(Directory {
+                            Arc::new(RwLock::new(Directory {
                                 mode: 0o600, // rw-: cannot exec (cd) into to create subfiles
                                 file: None,
-                                parent: Rc::downgrade(&root),
+                                parent: Arc::downgrade(&root),
                                 children: Some(HashMap::new()),
                             })));
-            let child = Rc::new(RefCell::new(Directory {
+            let child = Arc::new(RwLock::new(Directory {
                 mode: 0o300, // _wx: all we need
                 file: None,
-                parent: Rc::downgrade(&root),
+                parent: Arc::downgrade(&root),
                 children: Some(HashMap::new()),
             }));
             {
-                let mut child_borrow = child.borrow_mut();
+                let mut child_borrow = child.write();
                 let child_children = child_borrow.children.as_mut().unwrap();
                 child_children.insert(OsString::from("d"),
-                                      Rc::new(RefCell::new(Directory {
+                                      Arc::new(RwLock::new(Directory {
                                           mode: 0o775,
                                           file: None,
-                                          parent: Rc::downgrade(&child),
+                                          parent: Arc::downgrade(&child),
                                           children: Some(HashMap::new()),
                                       })));
             }
@@ -1392,18 +1366,18 @@ mod test {
         let exp = FS::with_mode(0o700);
         {
             let ref mut root = exp.inner.lock().pwd;
-            root.borrow_mut()
+            root.write()
                 .children
                 .as_mut()
                 .unwrap()
                 .insert(OsString::from("a"),
-                        Rc::new(RefCell::new(Directory {
+                        Arc::new(RwLock::new(Directory {
                             mode: 0o300,
                             file: Some(Arc::new(RwLock::new(RawFile {
                                 valid: true,
                                 data: vec![1, 2, 3, 4],
                             }))),
-                            parent: Rc::downgrade(&root),
+                            parent: Arc::downgrade(&root),
                             children: None,
                         })));
         }
