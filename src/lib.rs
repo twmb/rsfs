@@ -28,9 +28,9 @@
 
 mod fs;
 
-pub mod rs;
+pub mod disk;
+// pub mod disk::fs::unix::fs;
 pub mod mem;
-pub mod testfs;
 pub mod errors;
 pub mod path_parts;
 

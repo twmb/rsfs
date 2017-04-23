@@ -19,10 +19,10 @@
 //! ```
 //! use rsfs::*;
 //! use rsfs::errors::*;
-//! use rsfs::testfs::{InKind, AtFile};
+//! use rsfs::mem::test::fs::{FS, InKind, AtFile};
 //! use std::io::{Read, Result, Seek, SeekFrom, Write};
 //!
-//! let fs = rsfs::testfs::FS::with_mode(0o300);
+//! let fs = FS::with_mode(0o300);
 //!
 //! // push a sequence that we want to trigger failure on:
 //! // a successful read followed by a failure.
@@ -76,8 +76,8 @@ extern crate parking_lot;
 
 use self::parking_lot::Mutex;
 
-use super::fs;
-use super::mem;
+use fs;
+use mem::fs as mem;
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -518,7 +518,7 @@ impl FS {
     }
 }
 
-impl fs::FS for FS {
+impl fs::GenFS for FS {
     type Metadata = mem::Metadata;
     type OpenOptions = OpenOptions;
     type DirBuilder = DirBuilder;
@@ -571,7 +571,7 @@ impl fs::FS for FS {
 mod test {
     use super::*;
     use errors::*;
-    use fs::{DirBuilder, FS as FST, OpenOptions};
+    use fs::{DirBuilder, GenFS, OpenOptions};
     use std::io::{Error, Read, Seek, SeekFrom, Write};
 
     fn errs_eq(l: Error, r: Error) -> bool {

@@ -5,6 +5,16 @@ use std::io::{Read, Seek, Write};
 use std::io::Result;
 use std::path::{Path, PathBuf};
 
+pub trait Permissions {
+    fn readonly(&self) -> bool;
+    fn set_readonly(&mut self, readonly: bool);
+}
+
+pub trait FileType {
+    fn is_dir(&self) -> bool;
+    fn is_file(&self) -> bool;
+}
+
 /// Metadata information about a file.
 ///
 /// This is meant to mirror `std::fs::Metadata`. A few less important functions are missing.
@@ -32,7 +42,7 @@ pub trait Metadata {
 /// systems.
 pub trait File: Read + Seek + Write {
     /// Metadata is an associated type until traits can return `impl Trait`.
-    type Metadata;
+    type Metadata: Metadata;
 
     /// Queries information about the underlying file.
     fn metadata(&self) -> Result<Self::Metadata>;
@@ -89,27 +99,30 @@ pub trait DirBuilder {
 /// learn about the entry.
 pub trait DirEntry {
     /// Metadata is an associated type until traits can return `impl Trait`.
-    type Metadata;
+    type Metadata: Metadata;
+    // TODO type FileType: FileType;
 
     /// Returns the full path to the file or directory this entry represents.
     fn path(&self) -> PathBuf;
-    /// Returns the base name of the file or directory this entry represents.
-    fn file_name(&self) -> OsString;
     /// Returns metadata for the file this entry represents.
     fn metadata(&self) -> Result<Self::Metadata>;
+    /// Returns the base name of the file or directory this entry represents.
+    fn file_name(&self) -> OsString;
+
+    // TODO fn file_type(&self) -> Result<FileType>
 }
 
 /// The filesystem underpinning all operations. All filesystem operations in code should use the
 /// same, single filesystem that is created at initialization.
-pub trait FS {
+pub trait GenFS {
     /// Metadata is an associated type until traits can return `impl Trait`.
-    type Metadata;
+    type Metadata: Metadata;
     /// OpenOptions is an associated type until traits can return `impl Trait`.
-    type OpenOptions;
+    type OpenOptions: OpenOptions;
     /// DirBuilder is an associated type until traits can return `impl Trait`.
-    type DirBuilder;
+    type DirBuilder: DirBuilder;
     /// DirEntry is an associated type until traits can return `impl Trait`.
-    type DirEntry;
+    type DirEntry: DirEntry;
     /// ReadDir is an associated type until traits can return `impl Trait`.
     type ReadDir: Iterator<Item = Result<Self::DirEntry>>;
 
@@ -117,15 +130,17 @@ pub trait FS {
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata>;
     /// Returns an iterator of the entries within a directory.
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir>;
-    /// Renames a file or directory at `from` to `to`, replacing `to` if it exists (and, for a
-    /// directory, is empty).
-    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()>;
     /// Removes an existing, empty directory.
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()>;
     /// Removes a directory at path after removing all of its contents.
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()>;
     /// Removes a file from the filesystem.
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()>;
+    /// Renames a file or directory at `from` to `to`, replacing `to` if it exists (and, for a
+    /// directory, is empty).
+    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()>;
+
+    // TODO fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> Result<()> is chmod
 
     /// Returns an OpenOptions for a file for this filesytem.
     fn new_openopts(&self) -> Self::OpenOptions;

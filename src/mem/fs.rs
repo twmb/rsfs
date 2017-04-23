@@ -15,13 +15,14 @@
 //!
 //! ```
 //! use rsfs::*;
+//! use rsfs::mem::fs::FS;
 //! use std::ffi::OsString;
 //! use std::io::{Read, Seek, SeekFrom, Write};
 //! use std::path::PathBuf;
 //!
 //! // setup a few directories
 //!
-//! let fs = rsfs::mem::FS::with_mode(0o300);
+//! let fs = FS::with_mode(0o300);
 //! assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
 //!
 //! // open a file, write to it, and read from it
@@ -56,9 +57,9 @@
 extern crate parking_lot;
 
 use self::parking_lot::{Mutex, RwLock};
-use super::errors::*;
-use super::fs;
-use super::path_parts::{self, IteratorExt, Part};
+use errors::*;
+use fs;
+use path_parts::{self, IteratorExt, Part};
 
 use std::cmp::{self, Ordering};
 use std::collections::HashMap;
@@ -479,10 +480,12 @@ impl FS {
     ///
     /// ```
     /// use rsfs::*;
+    /// use rsfs::mem::fs::FS;
+    ///
     /// use std::ffi::OsString;
     /// use std::path::PathBuf;
     ///
-    /// let fs = rsfs::mem::FS::new();
+    /// let fs = FS::new();
     /// assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
     ///
     /// assert!(fs.cd("a/b").is_ok());
@@ -516,7 +519,7 @@ impl PartialEq for FS {
     }
 }
 
-impl fs::FS for FS {
+impl fs::GenFS for FS {
     type Metadata = Metadata;
     type OpenOptions = OpenOptions;
     type DirBuilder = DirBuilder;
@@ -1196,7 +1199,7 @@ fn open_existing(fs: &Arc<RwLock<Directory>>, options: &OpenOptions) -> Result<F
 #[cfg(test)]
 mod test {
     use super::*;
-    use fs::{DirBuilder, DirEntry, FS as FST, File, Metadata, OpenOptions};
+    use fs::{DirBuilder, DirEntry, File, GenFS, Metadata, OpenOptions};
     use std::ffi::OsString;
     use std::io::Error;
     use std::sync::mpsc;

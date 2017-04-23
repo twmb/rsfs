@@ -4,7 +4,9 @@
 //!
 //! ```
 //! use rsfs::*;
-//! let fs = rsfs::rs::FS;
+//! use rsfs::disk;
+//!
+//! let fs = disk::fs::FS;
 //!
 //! let meta = fs.metadata("/");
 //! assert!(meta.unwrap().is_dir());
@@ -13,12 +15,34 @@
 //! [`rsfs::FS`]: ../trait.FS.html
 //! [`std::fs`]: https://doc.rust-lang.org/std/fs/
 
-use super::fs;
+use fs;
 use std::ffi::OsString;
 use std::fs as rs_fs;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+pub struct Permissions(rs_fs::Permissions);
+
+impl fs::Permissions for Permissions {
+    fn readonly(&self) -> bool {
+        self.0.readonly()
+    }
+    fn set_readonly(&mut self, readonly: bool) {
+        self.0.set_readonly(readonly)
+    }
+}
+
+pub struct FileType(rs_fs::FileType);
+
+impl fs::FileType for FileType {
+    fn is_dir(&self) -> bool {
+        self.0.is_dir()
+    }
+    fn is_file(&self) -> bool {
+        self.0.is_file()
+    }
+}
 
 /// A single element tuple containing a [`std::fs::Metadata`].
 ///
@@ -179,7 +203,7 @@ impl Iterator for ReadDir {
 #[derive(Copy, Clone, Debug)]
 pub struct FS;
 
-impl fs::FS for FS {
+impl fs::GenFS for FS {
     type Metadata = Metadata;
     type OpenOptions = OpenOptions;
     type DirBuilder = DirBuilder;
