@@ -18,41 +18,62 @@
 //! [`rsfs::FS`]: ../trait.FS.html
 //! [`std::fs`]: https://doc.rust-lang.org/std/fs/
 
-use fs;
 use std::ffi::OsString;
 use std::fs as rs_fs;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use fs;
+
 #[cfg(unix)]
 use unix_ext;
 
-/// A single element tuple containing a [`std::fs::Permissions`].
+/// A single element tuple containing a [`std::fs::DirBuilder`].
 ///
-/// [`std::fs::Permissions`]: https://doc.rust-lang.org/std/fs/struct.Permissions.html
+/// [`std::fs::DirBuilder`]: https://doc.rust-lang.org/std/fs/struct.DirBuilder.html
 #[derive(Debug)]
-pub struct Permissions(rs_fs::Permissions);
+pub struct DirBuilder(rs_fs::DirBuilder);
 
-impl fs::Permissions for Permissions {
-    fn readonly(&self) -> bool {
-        self.0.readonly()
+impl fs::DirBuilder for DirBuilder {
+    fn recursive(&mut self, recursive: bool) -> &mut Self {
+        self.0.recursive(recursive);
+        self
     }
-    fn set_readonly(&mut self, readonly: bool) {
-        self.0.set_readonly(readonly)
+    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.0.create(path)
     }
 }
 
 #[cfg(unix)]
-impl unix_ext::PermissionsExt for Permissions {
-    fn mode(&self) -> u32 {
-        self.0.mode()
+impl unix_ext::DirBuilderExt for DirBuilder {
+    fn mode(&mut self, mode: u32) -> &mut Self {
+        self.0.mode(mode);
+        self
     }
-    fn set_mode(&mut self, mode: u32) {
-        self.0.set_mode(mode)
+}
+
+/// A single element tuple containing a [`std::fs::DirEntry`].
+///
+/// [`std::fs::DirEntry`]: https://doc.rust-lang.org/std/fs/struct.DirEntry.html
+#[derive(Debug)]
+pub struct DirEntry(rs_fs::DirEntry);
+
+impl fs::DirEntry for DirEntry {
+    type Metadata = Metadata;
+    type FileType = FileType;
+
+    fn path(&self) -> PathBuf {
+        self.0.path()
     }
-    fn from_mode(mode: u32) -> Self {
-        Permissions(rs_fs::Permissions::from_mode(mode))
+    fn metadata(&self) -> Result<Self::Metadata> {
+        self.0.metadata().map(Metadata)
+    }
+    fn file_type(&self) -> Result<Self::FileType> {
+        self.0.file_type().map(FileType)
+    }
+    fn file_name(&self) -> OsString {
+        self.0.file_name()
     }
 }
 
@@ -68,33 +89,6 @@ impl fs::FileType for FileType {
     }
     fn is_file(&self) -> bool {
         self.0.is_file()
-    }
-}
-
-/// A single element tuple containing a [`std::fs::Metadata`].
-///
-/// [`std::fs::Metadata`]: https://doc.rust-lang.org/std/fs/struct.Metadata.html
-#[derive(Debug)]
-pub struct Metadata(rs_fs::Metadata);
-
-impl fs::Metadata for Metadata {
-    type Permissions = Permissions;
-    type FileType = FileType;
-
-    fn file_type(&self) -> Self::FileType {
-        FileType(self.0.file_type())
-    }
-    fn is_dir(&self) -> bool {
-        self.0.is_dir()
-    }
-    fn is_file(&self) -> bool {
-        self.0.is_file()
-    }
-    fn len(&self) -> u64 {
-        self.0.len()
-    }
-    fn permissions(&self) -> Self::Permissions {
-        Permissions(self.0.permissions())
     }
 }
 
@@ -130,6 +124,33 @@ impl Write for File {
 impl Seek for File {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         self.0.seek(pos)
+    }
+}
+
+/// A single element tuple containing a [`std::fs::Metadata`].
+///
+/// [`std::fs::Metadata`]: https://doc.rust-lang.org/std/fs/struct.Metadata.html
+#[derive(Debug)]
+pub struct Metadata(rs_fs::Metadata);
+
+impl fs::Metadata for Metadata {
+    type Permissions = Permissions;
+    type FileType = FileType;
+
+    fn file_type(&self) -> Self::FileType {
+        FileType(self.0.file_type())
+    }
+    fn is_dir(&self) -> bool {
+        self.0.is_dir()
+    }
+    fn is_file(&self) -> bool {
+        self.0.is_file()
+    }
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+    fn permissions(&self) -> Self::Permissions {
+        Permissions(self.0.permissions())
     }
 }
 
@@ -179,53 +200,31 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
     }
 }
 
-
-
-/// A single element tuple containing a [`std::fs::DirBuilder`].
+/// A single element tuple containing a [`std::fs::Permissions`].
 ///
-/// [`std::fs::DirBuilder`]: https://doc.rust-lang.org/std/fs/struct.DirBuilder.html
+/// [`std::fs::Permissions`]: https://doc.rust-lang.org/std/fs/struct.Permissions.html
 #[derive(Debug)]
-pub struct DirBuilder(rs_fs::DirBuilder);
+pub struct Permissions(rs_fs::Permissions);
 
-impl fs::DirBuilder for DirBuilder {
-    fn recursive(&mut self, recursive: bool) -> &mut Self {
-        self.0.recursive(recursive);
-        self
+impl fs::Permissions for Permissions {
+    fn readonly(&self) -> bool {
+        self.0.readonly()
     }
-    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.0.create(path)
+    fn set_readonly(&mut self, readonly: bool) {
+        self.0.set_readonly(readonly)
     }
 }
 
 #[cfg(unix)]
-impl unix_ext::DirBuilderExt for DirBuilder {
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        self.0.mode(mode);
-        self
+impl unix_ext::PermissionsExt for Permissions {
+    fn mode(&self) -> u32 {
+        self.0.mode()
     }
-}
-
-/// A single element tuple containing a [`std::fs::DirEntry`].
-///
-/// [`std::fs::DirEntry`]: https://doc.rust-lang.org/std/fs/struct.DirEntry.html
-#[derive(Debug)]
-pub struct DirEntry(rs_fs::DirEntry);
-
-impl fs::DirEntry for DirEntry {
-    type Metadata = Metadata;
-    type FileType = FileType;
-
-    fn path(&self) -> PathBuf {
-        self.0.path()
+    fn set_mode(&mut self, mode: u32) {
+        self.0.set_mode(mode)
     }
-    fn metadata(&self) -> Result<Self::Metadata> {
-        self.0.metadata().map(Metadata)
-    }
-    fn file_type(&self) -> Result<Self::FileType> {
-        self.0.file_type().map(FileType)
-    }
-    fn file_name(&self) -> OsString {
-        self.0.file_name()
+    fn from_mode(mode: u32) -> Self {
+        Permissions(rs_fs::Permissions::from_mode(mode))
     }
 }
 
@@ -276,7 +275,7 @@ impl fs::GenFS for FS {
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
         rs_fs::rename(from, to)
     }
-    fn set_permissions<P: AsRef<Path>>(path: P, perm: Self::Permissions) -> Result<()> {
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
         rs_fs::set_permissions(path, perm.0)
     }
     fn new_openopts(&self) -> Self::OpenOptions {
