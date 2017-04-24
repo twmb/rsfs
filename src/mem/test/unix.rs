@@ -19,6 +19,7 @@
 //! ```
 //! use rsfs::*;
 //! use rsfs::errors::*;
+//! use rsfs::unix_ext::*;
 //! use rsfs::mem::test::fs::{FS, InKind, AtFile};
 //! use std::io::{Read, Result, Seek, SeekFrom, Write};
 //!
@@ -84,6 +85,7 @@ use std::ffi::OsString;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use unix_ext;
 
 /// The `testfs` is about to call a [`File`] method.
 ///
@@ -143,6 +145,10 @@ pub enum AtDirEntry {
     ///
     /// [`metadata`]: ../fs/trait.DirEntry.html#tymethod.metadata
     Metadata,
+    /// The next call will be [`file_type`].
+    ///
+    /// [`file_type`]: ../fs/trait.DirEntry.html#tymethod.file_type
+    FileType,
 }
 
 /// The `testfs` is about to call a [`ReadDir`] method.
@@ -169,10 +175,6 @@ pub enum AtFS {
     ///
     /// [`read_dir`]: ../fs/trait.FS.html#tymethod.read_dir
     ReadDir,
-    /// The next call will be [`rename`].
-    ///
-    /// [`rename`]: ../fs/trait.FS.html#tymethod.rename
-    Rename,
     /// The next call will be [`remove_dir`].
     ///
     /// [`remove_dir`]: ../fs/trait.FS.html#tymethod.remove_dir
@@ -185,6 +187,14 @@ pub enum AtFS {
     ///
     /// [`remove_file`]: ../fs/trait.FS.html#tymethod.remove_file
     RemoveFile,
+    /// The next call will be [`rename`].
+    ///
+    /// [`rename`]: ../fs/trait.FS.html#tymethod.rename
+    Rename,
+    /// The next call will be [`set_permissions`].
+    ///
+    /// [`set_permissions`]: ../fs/trait.FS.html#tymethod.set_permissions
+    SetPermissions,
 }
 
 /// The `testfs` is about to call a method that can error.
@@ -222,6 +232,71 @@ pub enum InKind {
     /// [`FS`]: ../fs/trait.FS.html
     /// [`AtFS`]: enum.AtFS.html
     FS(AtFS),
+}
+
+/// A builder used to create directories in various manners.
+///
+/// This struct wraps [`mem::DirBuilder`] with the addition that `.create()` can potentially
+/// consume a [`testfs`] injected error. See the module [documentation] for an example.
+///
+/// [`mem::DirBuilder`]: ../mem/struct.DirBuilder.html
+/// [`testfs`]: index.html
+/// [documentation]: index.html
+pub struct DirBuilder {
+    seq: ResultSeq,
+    inner: mem::DirBuilder,
+}
+
+impl fs::DirBuilder for DirBuilder {
+    fn recursive(&mut self, recursive: bool) -> &mut Self {
+        self.inner.recursive(recursive);
+        self
+    }
+    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.seq.maybe_seq(InKind::DirBuilder(AtDirBuilder::Create))?;
+        self.inner.create(path)
+    }
+}
+
+impl unix_ext::DirBuilderExt for DirBuilder {
+    fn mode(&mut self, mode: u32) -> &mut Self {
+        self.inner.mode(mode);
+        self
+    }
+}
+
+/// Entries returned by the [`ReadDir`] iterator.
+///
+/// This struct wraps [`mem::DirEntry`] with the addition that `.metadata()` can potentially
+/// consume a [`testfs`] injected error. See the module [documentation] for an example.
+///
+/// [`ReadDir`]: struct.ReadDir.html
+/// [`mem::DirEntry`]: ../mem/struct.DirEntry.html
+/// [`testfs`]: index.html
+/// [documentation]: index.html
+pub struct DirEntry {
+    seq: ResultSeq,
+    inner: mem::DirEntry,
+}
+
+impl fs::DirEntry for DirEntry {
+    type Metadata = mem::Metadata;
+    type FileType = mem::FileType;
+
+    fn path(&self) -> PathBuf {
+        self.inner.path()
+    }
+    fn metadata(&self) -> Result<Self::Metadata> {
+        self.seq.maybe_seq(InKind::DirEntry(AtDirEntry::Metadata))?;
+        self.inner.metadata()
+    }
+    fn file_type(&self) -> Result<Self::FileType> {
+        self.seq.maybe_seq(InKind::DirEntry(AtDirEntry::FileType))?;
+        self.inner.file_type()
+    }
+    fn file_name(&self) -> OsString {
+        self.inner.file_name()
+    }
 }
 
 /// A view into a file on the filesystem.
@@ -311,10 +386,6 @@ impl fs::OpenOptions for OpenOptions {
         self.inner.create_new(create_new);
         self
     }
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        self.inner.mode(mode);
-        self
-    }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
         self.seq.maybe_seq(InKind::OpenOptions(AtOpenOpts::Open))?;
         self.inner.open(path).map(|f| {
@@ -326,60 +397,10 @@ impl fs::OpenOptions for OpenOptions {
     }
 }
 
-/// A builder used to create directories in various manners.
-///
-/// This struct wraps [`mem::DirBuilder`] with the addition that `.create()` can potentially
-/// consume a [`testfs`] injected error. See the module [documentation] for an example.
-///
-/// [`mem::DirBuilder`]: ../mem/struct.DirBuilder.html
-/// [`testfs`]: index.html
-/// [documentation]: index.html
-pub struct DirBuilder {
-    seq: ResultSeq,
-    inner: mem::DirBuilder,
-}
-
-impl fs::DirBuilder for DirBuilder {
-    fn recursive(&mut self, recursive: bool) -> &mut Self {
-        self.inner.recursive(recursive);
-        self
-    }
+impl unix_ext::OpenOptionsExt for OpenOptions {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.inner.mode(mode);
         self
-    }
-    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.seq.maybe_seq(InKind::DirBuilder(AtDirBuilder::Create))?;
-        self.inner.create(path)
-    }
-}
-
-/// Entries returned by the [`ReadDir`] iterator.
-///
-/// This struct wraps [`mem::DirEntry`] with the addition that `.metadata()` can potentially
-/// consume a [`testfs`] injected error. See the module [documentation] for an example.
-///
-/// [`ReadDir`]: struct.ReadDir.html
-/// [`mem::DirEntry`]: ../mem/struct.DirEntry.html
-/// [`testfs`]: index.html
-/// [documentation]: index.html
-pub struct DirEntry {
-    seq: ResultSeq,
-    inner: mem::DirEntry,
-}
-
-impl fs::DirEntry for DirEntry {
-    type Metadata = mem::Metadata;
-
-    fn path(&self) -> PathBuf {
-        self.inner.path()
-    }
-    fn file_name(&self) -> OsString {
-        self.inner.file_name()
-    }
-    fn metadata(&self) -> Result<Self::Metadata> {
-        self.seq.maybe_seq(InKind::DirEntry(AtDirEntry::Metadata))?;
-        self.inner.metadata()
     }
 }
 
@@ -450,9 +471,9 @@ pub struct FS {
 }
 
 impl FS {
-    /// Creates an empty `FS` with mode `0o775`.
+    /// Creates an empty `FS` with mode `0o777`.
     pub fn new() -> FS {
-        Self::with_mode(0o775)
+        Self::with_mode(0o777)
     }
 
     /// Creates an empty `FS` with the given mode.
@@ -474,19 +495,6 @@ impl FS {
     /// [`mem::FS`]: ../mem/struct.FS.html
     pub fn cd<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.inner.cd(path)
-    }
-
-    /// Changes the file or directory at `path`'s mode.
-    ///
-    /// This call simply calls [`chmod`] on the wrapped [`mem::FS`].
-    ///
-    /// NOTE: This does not consume from sequence errors as this should only be used while setting
-    /// up a test filesystem.
-    ///
-    /// [`chmod`]: ../mem/struct.FS.html#method.chmod
-    /// [`mem::FS`]: ../mem/struct.FS.html
-    pub fn chmod<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
-        self.inner.chmod(path, mode)
     }
 
     /// Pushes a sequence of closures to run on future operations that return `Result`.
@@ -519,10 +527,11 @@ impl FS {
 }
 
 impl fs::GenFS for FS {
-    type Metadata = mem::Metadata;
-    type OpenOptions = OpenOptions;
     type DirBuilder = DirBuilder;
     type DirEntry = DirEntry;
+    type Metadata = mem::Metadata;
+    type OpenOptions = OpenOptions;
+    type Permissions = mem::Permissions;
     type ReadDir = ReadDir;
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<mem::Metadata> {
@@ -537,10 +546,6 @@ impl fs::GenFS for FS {
             inner: res,
         })
     }
-    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        self.seq.maybe_seq(InKind::FS(AtFS::Rename))?;
-        self.inner.rename(from, to)
-    }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.seq.maybe_seq(InKind::FS(AtFS::RemoveDir))?;
         self.inner.remove_dir(path)
@@ -552,6 +557,14 @@ impl fs::GenFS for FS {
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.seq.maybe_seq(InKind::FS(AtFS::RemoveFile))?;
         self.inner.remove_file(path)
+    }
+    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
+        self.seq.maybe_seq(InKind::FS(AtFS::Rename))?;
+        self.inner.rename(from, to)
+    }
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
+        self.seq.maybe_seq(InKind::FS(AtFS::SetPermissions))?;
+        self.inner.set_permissions(path, perm)
     }
     fn new_openopts(&self) -> OpenOptions {
         OpenOptions {
@@ -573,6 +586,7 @@ mod test {
     use errors::*;
     use fs::{DirBuilder, GenFS, OpenOptions};
     use std::io::{Error, Read, Seek, SeekFrom, Write};
+    use unix_ext::*;
 
     fn errs_eq(l: Error, r: Error) -> bool {
         l.raw_os_error() == r.raw_os_error()
