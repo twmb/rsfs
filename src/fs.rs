@@ -170,7 +170,7 @@ pub trait GenFS {
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()>;
 
     /// Changes the permissions of a file or directory.
-    fn set_permissions<P: AsRef<Path>>(path: P, perm: Self::Permissions) -> Result<()>;
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()>;
 
     /// Returns a new OpenOptions for a file for this filesytem.
     ///
