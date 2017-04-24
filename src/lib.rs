@@ -15,8 +15,7 @@
 //! Not all filesystem operations are implemented yet. If something is missing, please feel free to
 //! implement it and open a PR to add it. Additionally, the current filesystem implementations are
 //! all based around Unix systems. Window's users can help by opening PRs to add in Windows
-//! specific behavior. If that ever occurs, the API will need to change to separate Unix specific
-//! functionality.
+//! specific behavior.
 //!
 //! The documentation of the traits in this module should closely resemble or be verbatim copies of
 //! the [`std::fs`] documentation for the respective structs.
@@ -27,11 +26,12 @@
 //! [`rsfs::testfs`]: testfs/index.html
 
 mod fs;
+pub use fs::*;
+
+#[cfg(unix)]
+pub mod unix_ext;
 
 pub mod disk;
-// pub mod disk::fs::unix::fs;
-pub mod mem;
+// pub mod mem;
 pub mod errors;
 pub mod path_parts;
-
-pub use fs::*;

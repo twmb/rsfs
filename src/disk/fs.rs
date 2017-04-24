@@ -4,12 +4,15 @@
 //!
 //! ```
 //! use rsfs::*;
-//! use rsfs::disk;
+//! use rsfs::unix_ext::*;
 //!
-//! let fs = disk::fs::FS;
+//! use rsfs::disk::fs;
 //!
-//! let meta = fs.metadata("/");
-//! assert!(meta.unwrap().is_dir());
+//! let fs = fs::FS;
+//!
+//! let meta = fs.metadata("/").unwrap();
+//! assert!(meta.is_dir());
+//! assert!(meta.permissions().mode() == 0o755);
 //! ```
 //!
 //! [`rsfs::FS`]: ../trait.FS.html
@@ -22,6 +25,13 @@ use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use unix_ext;
+
+/// A single element tuple containing a [`std::fs::Permissions`].
+///
+/// [`std::fs::Permissions`]: https://doc.rust-lang.org/std/fs/struct.Permissions.html
+#[derive(Debug)]
 pub struct Permissions(rs_fs::Permissions);
 
 impl fs::Permissions for Permissions {
@@ -33,6 +43,23 @@ impl fs::Permissions for Permissions {
     }
 }
 
+#[cfg(unix)]
+impl unix_ext::PermissionsExt for Permissions {
+    fn mode(&self) -> u32 {
+        self.0.mode()
+    }
+    fn set_mode(&mut self, mode: u32) {
+        self.0.set_mode(mode)
+    }
+    fn from_mode(mode: u32) -> Self {
+        Permissions(rs_fs::Permissions::from_mode(mode))
+    }
+}
+
+/// A single element tuple containing a [`std::fs::FileType`].
+///
+/// [`std::fs::FileType`]: https://doc.rust-lang.org/std/fs/struct.FileType.html
+#[derive(Debug)]
 pub struct FileType(rs_fs::FileType);
 
 impl fs::FileType for FileType {
@@ -51,6 +78,12 @@ impl fs::FileType for FileType {
 pub struct Metadata(rs_fs::Metadata);
 
 impl fs::Metadata for Metadata {
+    type Permissions = Permissions;
+    type FileType = FileType;
+
+    fn file_type(&self) -> Self::FileType {
+        FileType(self.0.file_type())
+    }
     fn is_dir(&self) -> bool {
         self.0.is_dir()
     }
@@ -60,50 +93,8 @@ impl fs::Metadata for Metadata {
     fn len(&self) -> u64 {
         self.0.len()
     }
-    fn permissions(&self) -> u32 {
-        self.0.permissions().mode()
-    }
-}
-
-/// A single element tuple containing a [`std::fs::OpenOptions`].
-///
-/// [`std::fs::OpenOptions`]: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html
-#[derive(Debug)]
-pub struct OpenOptions(rs_fs::OpenOptions);
-
-impl fs::OpenOptions for OpenOptions {
-    type File = File;
-
-    fn read(&mut self, read: bool) -> &mut Self {
-        self.0.read(read);
-        self
-    }
-    fn write(&mut self, write: bool) -> &mut Self {
-        self.0.write(write);
-        self
-    }
-    fn append(&mut self, append: bool) -> &mut Self {
-        self.0.append(append);
-        self
-    }
-    fn truncate(&mut self, truncate: bool) -> &mut Self {
-        self.0.truncate(truncate);
-        self
-    }
-    fn create(&mut self, create: bool) -> &mut Self {
-        self.0.create(create);
-        self
-    }
-    fn create_new(&mut self, create_new: bool) -> &mut Self {
-        self.0.create_new(create_new);
-        self
-    }
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        self.0.mode(mode);
-        self
-    }
-    fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
-        self.0.open(path).map(File)
+    fn permissions(&self) -> Self::Permissions {
+        Permissions(self.0.permissions())
     }
 }
 
@@ -142,6 +133,54 @@ impl Seek for File {
     }
 }
 
+/// A single element tuple containing a [`std::fs::OpenOptions`].
+///
+/// [`std::fs::OpenOptions`]: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html
+#[derive(Debug)]
+pub struct OpenOptions(rs_fs::OpenOptions);
+
+impl fs::OpenOptions for OpenOptions {
+    type File = File;
+
+    fn read(&mut self, read: bool) -> &mut Self {
+        self.0.read(read);
+        self
+    }
+    fn write(&mut self, write: bool) -> &mut Self {
+        self.0.write(write);
+        self
+    }
+    fn append(&mut self, append: bool) -> &mut Self {
+        self.0.append(append);
+        self
+    }
+    fn truncate(&mut self, truncate: bool) -> &mut Self {
+        self.0.truncate(truncate);
+        self
+    }
+    fn create(&mut self, create: bool) -> &mut Self {
+        self.0.create(create);
+        self
+    }
+    fn create_new(&mut self, create_new: bool) -> &mut Self {
+        self.0.create_new(create_new);
+        self
+    }
+    fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        self.0.open(path).map(File)
+    }
+}
+
+#[cfg(unix)]
+impl unix_ext::OpenOptionsExt for OpenOptions {
+    fn mode(&mut self, mode: u32) -> &mut Self {
+        self.0.mode(mode);
+        self
+    }
+}
+
+
+
 /// A single element tuple containing a [`std::fs::DirBuilder`].
 ///
 /// [`std::fs::DirBuilder`]: https://doc.rust-lang.org/std/fs/struct.DirBuilder.html
@@ -153,12 +192,16 @@ impl fs::DirBuilder for DirBuilder {
         self.0.recursive(recursive);
         self
     }
+    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.0.create(path)
+    }
+}
+
+#[cfg(unix)]
+impl unix_ext::DirBuilderExt for DirBuilder {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.0.mode(mode);
         self
-    }
-    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.0.create(path)
     }
 }
 
@@ -170,12 +213,16 @@ pub struct DirEntry(rs_fs::DirEntry);
 
 impl fs::DirEntry for DirEntry {
     type Metadata = Metadata;
+    type FileType = FileType;
 
     fn path(&self) -> PathBuf {
         self.0.path()
     }
     fn metadata(&self) -> Result<Self::Metadata> {
         self.0.metadata().map(Metadata)
+    }
+    fn file_type(&self) -> Result<Self::FileType> {
+        self.0.file_type().map(FileType)
     }
     fn file_name(&self) -> OsString {
         self.0.file_name()
@@ -204,10 +251,11 @@ impl Iterator for ReadDir {
 pub struct FS;
 
 impl fs::GenFS for FS {
-    type Metadata = Metadata;
-    type OpenOptions = OpenOptions;
     type DirBuilder = DirBuilder;
     type DirEntry = DirEntry;
+    type Metadata = Metadata;
+    type OpenOptions = OpenOptions;
+    type Permissions = Permissions;
     type ReadDir = ReadDir;
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
@@ -215,9 +263,6 @@ impl fs::GenFS for FS {
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir> {
         rs_fs::read_dir(path).map(ReadDir)
-    }
-    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        rs_fs::rename(from, to)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         rs_fs::remove_dir(path)
@@ -227,6 +272,12 @@ impl fs::GenFS for FS {
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         rs_fs::remove_file(path)
+    }
+    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
+        rs_fs::rename(from, to)
+    }
+    fn set_permissions<P: AsRef<Path>>(path: P, perm: Self::Permissions) -> Result<()> {
+        rs_fs::set_permissions(path, perm.0)
     }
     fn new_openopts(&self) -> Self::OpenOptions {
         OpenOptions(rs_fs::OpenOptions::new())
