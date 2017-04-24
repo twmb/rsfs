@@ -1,24 +1,23 @@
 //! An in memory filesystem.
 //!
-//! The [`FS`] provides an in memory file system. The current implementation mirrors file
-//! operations on a Unix system. This means that `mode`s are provided in the API by default and
-//! also means that errors return raw os errors that Unix systems return. Additionally, this API
-//! does not yet differentiate the error codes for the same failures from all Unix systems.
-//!
-//! I welcome PRs that add more cross-platform perfection out of the box, but I do generally
-//! believe this API is fine as is for many people.
+//! The [`FS`] provides an in memory file system. This implementation, only available on Unix
+//! systems, implements all [`unix_ext`] traits. Errors returned mimic true Unix error codes via
+//! the [`errors`] crate (which may not have the proper error codes for _all_ possible Unix systems
+//! yet).
 //!
 //! All API calls to FS operate under a mutex to ensure consistency. Reads to [`File`]s can be
-//! concurrent. This module returns proper (OS level) errors as appropriate.
+//! concurrent.
 //!
 //! # Example
 //!
 //! ```
-//! use rsfs::*;
-//! use rsfs::mem::fs::FS;
 //! use std::ffi::OsString;
 //! use std::io::{Read, Seek, SeekFrom, Write};
 //! use std::path::PathBuf;
+//!
+//! use rsfs::*;
+//! use rsfs::unix_ext::*;
+//! use rsfs::mem::fs::FS;
 //!
 //! // setup a few directories
 //!
@@ -53,13 +52,10 @@
 //! ```
 //!
 //! [`FS`]: struct.FS.html
+//! [`unix_ext`]: ../unix_ext/index.html
+//! [`errors`]: ../errors/index.html
 
 extern crate parking_lot;
-
-use self::parking_lot::{Mutex, RwLock};
-use errors::*;
-use fs;
-use path_parts::{self, IteratorExt, Part};
 
 use std::cmp::{self, Ordering};
 use std::collections::HashMap;
@@ -70,45 +66,82 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::vec::IntoIter;
 
-// TODO this filesystem ignores prefixes.
-// File could be tested more, maybe, but the raw_file seems sufficient.
+use self::parking_lot::{Mutex, RwLock};
 
-// Differentiates between a directory and a file.
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum FileType {
-    Dir,
-    File,
-}
+use errors::*;
+use fs::{self, FileType as FTG, Metadata as MG};
+use path_parts::{self, IteratorExt, Part};
+use unix_ext::{self, PermissionsExt as PEG};
 
-/// DIRLEN is the length returned from Metadata's len() call for a directory. This is pulled from
-/// the initial file size that Unix uses for a directory sector. This module does not attempt to
-/// return a larger number if the directory contains many children with long names.
-pub const DIRLEN: u64 = 4096;
+// TODO File could be tested more, maybe, but the raw_file seems sufficient.
+// Permissions and FileType can be tested directly - right now they are tested indirectly.
 
-/// Metadata information about a file.
+// DIRLEN is the length returned from Metadata's len() call for a directory. This is pulled from
+// the initial file size that Unix uses for a directory sector. This module does not attempt to
+// return a larger number if the directory contains many children with long names.
+const DIRLEN: u64 = 4096;
+
+/// A builder used to create directories in various manners.
 ///
 /// See the module [documentation] for a comprehensive example.
 ///
 /// [documentation]: index.html
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Metadata {
-    filetype: FileType,
-    length: u64,
-    perms: u32,
+#[derive(Debug)]
+pub struct DirBuilder {
+    recursive: bool,
+    mode: u32,
+    fs: FS,
 }
 
-impl fs::Metadata for Metadata {
-    fn is_dir(&self) -> bool {
-        self.filetype == FileType::Dir
+impl fs::DirBuilder for DirBuilder {
+    fn recursive(&mut self, recursive: bool) -> &mut Self {
+        self.recursive = recursive;
+        self
     }
-    fn is_file(&self) -> bool {
-        self.filetype == FileType::File
+    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        if self.recursive {
+            self.fs.inner.lock().create_dir_all(path, self.mode)
+        } else {
+            self.fs.inner.lock().mkdir(path, self.mode)
+        }
     }
-    fn len(&self) -> u64 {
-        self.length
+}
+
+impl unix_ext::DirBuilderExt for DirBuilder {
+    fn mode(&mut self, mode: u32) -> &mut Self {
+        self.mode = mode;
+        self
     }
-    fn permissions(&self) -> u32 {
-        self.perms
+}
+
+/// Entries returned by the [`ReadDir`] iterator.
+///
+/// See the module [documentation] for a comprehensive example.
+///
+/// [`ReadDir`]: struct.ReadDir.html
+/// [documentation]: index.html
+#[derive(Debug, PartialEq)]
+pub struct DirEntry {
+    dir: PathBuf,
+    base: OsString,
+    meta: Metadata,
+}
+
+impl fs::DirEntry for DirEntry {
+    type Metadata = Metadata;
+    type FileType = FileType;
+
+    fn path(&self) -> PathBuf {
+        self.dir.join(self.base.clone())
+    }
+    fn metadata(&self) -> Result<Self::Metadata> {
+        Ok(self.meta)
+    }
+    fn file_type(&self) -> Result<Self::FileType> {
+        Ok(self.meta.file_type())
+    }
+    fn file_name(&self) -> OsString {
+        self.base.clone()
     }
 }
 
@@ -181,7 +214,8 @@ impl RawFile {
 /// A view into a file on the filesystem.
 ///
 /// An instance of `File` can be read or written to depending on the options it was opened with.
-/// Files also implement `Seek` to alter the logical cursor position into the file.
+/// Files also implement `Seek` to alter the logical cursor position into the file (only `SeekFrom`
+/// is currently implemented).
 ///
 /// See the module [documentation] for a comprehensive example.
 ///
@@ -252,15 +286,59 @@ impl Seek for File {
     }
 }
 
-/// Options and flags which can be used to configure how a file is opened.
-///
-/// This exactly mirrors [`std::fs::OpenOptions`] with the addition of `mode` from
-/// [`std::os::unix::fs::OpenOptionsExt`].
+/// Represents the type of a file.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FileType {
+    // TODO this is quite possibly the laziest implementation possible. It could be cleaner.
+    dir: bool,
+}
+
+impl fs::FileType for FileType {
+    fn is_dir(&self) -> bool {
+        self.dir
+    }
+    fn is_file(&self) -> bool {
+        !self.dir
+    }
+}
+
+/// Metadata information about a file.
 ///
 /// See the module [documentation] for a comprehensive example.
 ///
-/// [`std::fs::OpenOptions`]: https://doc.rust-lang.org/std/fs/struct.OpenOptions.html
-/// [`std::os::unix::fs::OpenOptionsExt`]: https://doc.rust-lang.org/std/os/unix/fs/trait.OpenOptionsExt.html
+/// [documentation]: index.html
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Metadata {
+    filetype: FileType,
+    length: u64,
+    perms: Permissions,
+}
+
+impl fs::Metadata for Metadata {
+    type Permissions = Permissions;
+    type FileType = FileType;
+
+    fn file_type(&self) -> Self::FileType {
+        self.filetype
+    }
+    fn is_dir(&self) -> bool {
+        self.filetype.is_dir()
+    }
+    fn is_file(&self) -> bool {
+        self.filetype.is_file()
+    }
+    fn len(&self) -> u64 {
+        self.length
+    }
+    fn permissions(&self) -> Self::Permissions {
+        self.perms
+    }
+}
+
+/// Options and flags which can be used to configure how a file is opened.
+///
+/// See the module [documentation] for a comprehensive example.
+///
 /// [documentation]: index.html
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -301,73 +379,15 @@ impl fs::OpenOptions for OpenOptions {
         self.excl = create_new;
         self
     }
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        self.mode = mode;
-        self
-    }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
         self.fs.inner.lock().open(path, self)
     }
 }
 
-/// A builder used to create directories in various manners.
-///
-/// This exactly mirrors [`std::fs::DirBuilder`] with the addition of `mode` from
-/// [`std::os::unix::fs::DirBuilderExt`].
-///
-/// See the module [documentation] for a comprehensive example.
-///
-/// [`std::fs::DirBuilder`]: https://doc.rust-lang.org/std/fs/struct.DirBuilder.html
-/// [`std::os::unix::fs::DirBuilderExt`]: https://doc.rust-lang.org/std/os/unix/fs/trait.DirBuilderExt.html
-/// [documentation]: index.html
-pub struct DirBuilder {
-    recursive: bool,
-    mode: u32,
-    fs: FS,
-}
-
-impl fs::DirBuilder for DirBuilder {
-    fn recursive(&mut self, recursive: bool) -> &mut Self {
-        self.recursive = recursive;
-        self
-    }
+impl unix_ext::OpenOptionsExt for OpenOptions {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.mode = mode;
         self
-    }
-    fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        if self.recursive {
-            self.fs.inner.lock().create_dir_all(path, self.mode)
-        } else {
-            self.fs.inner.lock().mkdir(path, self.mode)
-        }
-    }
-}
-
-/// Entries returned by the [`ReadDir`] iterator.
-///
-/// See the module [documentation] for a comprehensive example.
-///
-/// [`ReadDir`]: struct.ReadDir.html
-/// [documentation]: index.html
-#[derive(Debug, PartialEq)]
-pub struct DirEntry {
-    dir: PathBuf,
-    base: OsString,
-    meta: Metadata,
-}
-
-impl fs::DirEntry for DirEntry {
-    type Metadata = Metadata;
-
-    fn path(&self) -> PathBuf {
-        self.dir.join(self.base.clone())
-    }
-    fn file_name(&self) -> OsString {
-        self.base.clone()
-    }
-    fn metadata(&self) -> Result<Self::Metadata> {
-        Ok(self.meta)
     }
 }
 
@@ -380,6 +400,7 @@ impl fs::DirEntry for DirEntry {
 /// [`read_dir`]: struct.FS.html#method.read_dir
 /// [`std::mem::FS`]: struct.FS.html
 /// [documentation]: index.html
+#[derive(Debug)]
 pub struct ReadDir {
     ents: IntoIter<DirEntry>,
 }
@@ -403,15 +424,15 @@ impl ReadDir {
                 meta: || -> Metadata {
                     if dirent.is_dir() {
                         Metadata {
-                            filetype: FileType::Dir,
+                            filetype: FileType { dir: true },
                             length: DIRLEN,
-                            perms: dirent.mode,
+                            perms: Permissions::from_mode(dirent.mode),
                         }
                     } else {
                         Metadata {
-                            filetype: FileType::File,
+                            filetype: FileType { dir: false },
                             length: dirent.file.as_ref().unwrap().read().data.len() as u64,
-                            perms: dirent.mode,
+                            perms: Permissions::from_mode(dirent.mode),
                         }
                     }
                 }(),
@@ -433,6 +454,37 @@ impl Iterator for ReadDir {
     }
 }
 
+/// Representation of the various permissions on a file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Permissions {
+    mode: u32,
+}
+
+impl fs::Permissions for Permissions {
+    fn readonly(&self) -> bool {
+        self.mode & 0o400 != 0
+    }
+    fn set_readonly(&mut self, readonly: bool) {
+        if readonly {
+            self.mode |= 0o400
+        } else {
+            self.mode &= !0o400
+        }
+    }
+}
+
+impl unix_ext::PermissionsExt for Permissions {
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+    fn set_mode(&mut self, mode: u32) {
+        self.mode = mode
+    }
+    fn from_mode(mode: u32) -> Self {
+        Permissions { mode: mode }
+    }
+}
+
 /// An in memory struct that satisfies [`rsfs::FS`].
 ///
 /// `FS` is thread safe and copyable. It operates internally with an `Arc<Mutex<FileSystem>>`
@@ -451,9 +503,9 @@ pub struct FS {
 }
 
 impl FS {
-    /// Creates an empty `FS` with mode `0o775`.
+    /// Creates an empty `FS` with mode `0o777`.
     pub fn new() -> FS {
-        Self::with_mode(0o775)
+        Self::with_mode(0o777)
     }
 
     /// Creates an empty `FS` with the given mode.
@@ -480,6 +532,7 @@ impl FS {
     ///
     /// ```
     /// use rsfs::*;
+    /// use rsfs::unix_ext::*;
     /// use rsfs::mem::fs::FS;
     ///
     /// use std::ffi::OsString;
@@ -501,10 +554,6 @@ impl FS {
     pub fn cd<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.inner.lock().cd(path)
     }
-    /// Changes the file or directory at `path`'s mode.
-    pub fn chmod<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
-        self.inner.lock().chmod(path, mode)
-    }
 }
 
 impl Default for FS {
@@ -520,10 +569,11 @@ impl PartialEq for FS {
 }
 
 impl fs::GenFS for FS {
-    type Metadata = Metadata;
-    type OpenOptions = OpenOptions;
     type DirBuilder = DirBuilder;
     type DirEntry = DirEntry;
+    type Metadata = Metadata;
+    type OpenOptions = OpenOptions;
+    type Permissions = Permissions;
     type ReadDir = ReadDir;
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
@@ -531,9 +581,6 @@ impl fs::GenFS for FS {
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
         self.inner.lock().read_dir(path)
-    }
-    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        self.inner.lock().rename(from, to)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.inner.lock().remove_dir(path)
@@ -544,6 +591,13 @@ impl fs::GenFS for FS {
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.inner.lock().remove_file(path)
     }
+    fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
+        self.inner.lock().rename(from, to)
+    }
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
+        self.inner.lock().set_permissions(path, perm.mode)
+    }
+
     fn new_openopts(&self) -> OpenOptions {
         OpenOptions {
             read: false,
@@ -552,14 +606,14 @@ impl fs::GenFS for FS {
             trunc: false,
             create: false,
             excl: false,
-            mode: 0,
+            mode: 0o666, // default per unix_ext
             fs: self.clone(),
         }
     }
     fn new_dirbuilder(&self) -> DirBuilder {
         DirBuilder {
             recursive: false,
-            mode: 0,
+            mode: 0o777, // default per unix_ext
             fs: self.clone(),
         }
     }
@@ -660,12 +714,12 @@ impl FileSystem {
         let mut up = self.pwd.clone();
         let mut parts_iter = parts.into_iter().peekable();
         while parts_iter.peek()
-            .and_then(|part| if *part == Part::ParentDir {
-                Some(())
-            } else {
-                None
-            })
-            .is_some() {
+                        .and_then(|part| if *part == Part::ParentDir {
+                            Some(())
+                        } else {
+                            None
+                        })
+                        .is_some() {
             parts_iter.next();
             if let Some(parent) = {
                 let up = up.read();
@@ -702,8 +756,8 @@ impl FileSystem {
                 let fs = fs.read();
                 let children = fs.children.as_ref().ok_or_else(ENOTDIR)?;
                 children.get(parts_iter.next().unwrap().as_normal().unwrap())
-                    .cloned()
-                    .ok_or_else(ENOENT)?
+                        .cloned()
+                        .ok_or_else(ENOENT)?
             };
         }
         if !fs.read().is_dir() {
@@ -739,7 +793,7 @@ impl FileSystem {
         }
     }
 
-    fn chmod<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let base = match may_base {
             Some(base) => base,
@@ -830,8 +884,8 @@ impl FileSystem {
                     return Err(ENOENT());
                 } else {
                     return Ok(Metadata {
-                        filetype: FileType::Dir,
-                        perms: fs.mode,
+                        filetype: FileType { dir: true },
+                        perms: Permissions::from_mode(fs.mode),
                         length: DIRLEN,
                     });
                 }
@@ -848,14 +902,14 @@ impl FileSystem {
                 Ok(|| -> Metadata {
                     if child.is_dir() {
                         Metadata {
-                            filetype: FileType::Dir,
-                            perms: child.mode,
+                            filetype: FileType { dir: true },
+                            perms: Permissions::from_mode(child.mode),
                             length: DIRLEN,
                         }
                     } else {
                         Metadata {
-                            filetype: FileType::File,
-                            perms: child.mode,
+                            filetype: FileType { dir: false },
+                            perms: Permissions::from_mode(child.mode),
                             length: child.file.as_ref().unwrap().read().data.len() as u64,
                         }
                     }
@@ -889,10 +943,10 @@ impl FileSystem {
     fn remove<P: AsRef<Path>>(&self, path: P, kind: FileType) -> Result<()> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let base = may_base.ok_or_else(|| if path_empty(&path) {
-                ENOENT()
-            } else {
-                EACCES()
-            })?;
+                               ENOENT()
+                           } else {
+                               EACCES()
+                           })?;
 
         if !fs.read().executable() || !fs.read().writable() {
             return Err(EACCES());
@@ -904,19 +958,16 @@ impl FileSystem {
             let child = fs.read();
             let child = child.children.as_ref().unwrap().get(&base).ok_or_else(ENOENT)?;
 
-            match kind {
-                FileType::File => {
-                    if child.read().is_dir() {
-                        return Err(EISDIR());
-                    }
+            if kind.is_file() {
+                if child.read().is_dir() {
+                    return Err(EISDIR());
                 }
-                FileType::Dir => {
-                    if !child.read().is_dir() {
-                        return Err(ENOTDIR());
-                    }
-                    if !child.read().children.as_ref().unwrap().is_empty() {
-                        return Err(ENOTEMPTY());
-                    }
+            } else {
+                if !child.read().is_dir() {
+                    return Err(ENOTDIR());
+                }
+                if !child.read().children.as_ref().unwrap().is_empty() {
+                    return Err(ENOTEMPTY());
                 }
             }
         }
@@ -925,10 +976,10 @@ impl FileSystem {
         Ok(())
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.remove(path, FileType::File)
+        self.remove(path, FileType { dir: false })
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.remove(path, FileType::Dir)
+        self.remove(path, FileType { dir: true })
     }
 
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -1006,10 +1057,10 @@ impl FileSystem {
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
         let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from))?;
         let old_base = old_may_base.ok_or_else(|| if path_empty(&from) {
-                ENOENT()
-            } else {
-                Error::new(ErrorKind::Other, "rename of root unimplemented")
-            })?;
+                                       ENOENT()
+                                   } else {
+                                       Error::new(ErrorKind::Other, "rename of root unimplemented")
+                                   })?;
         let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to))?;
         let new_base =
             new_may_base.ok_or_else(|| if path_empty(&to) { ENOENT() } else { EEXIST() })?;
@@ -1130,9 +1181,9 @@ impl FileSystem {
             write: options.write,
             append: options.append,
             metadata: Metadata {
-                filetype: FileType::File,
+                filetype: FileType { dir: false },
                 length: 0,
-                perms: options.mode,
+                perms: Permissions::from_mode(options.mode),
             },
             file: file.clone(),
             at: 0,
@@ -1187,9 +1238,9 @@ fn open_existing(fs: &Arc<RwLock<Directory>>, options: &OpenOptions) -> Result<F
         write: write,
         append: options.append,
         metadata: Metadata {
-            filetype: FileType::File,
+            filetype: FileType { dir: false },
             length: len as u64,
-            perms: options.mode,
+            perms: Permissions::from_mode(options.mode),
         },
         file: file,
         at: 0,
@@ -1199,11 +1250,12 @@ fn open_existing(fs: &Arc<RwLock<Directory>>, options: &OpenOptions) -> Result<F
 #[cfg(test)]
 mod test {
     use super::*;
-    use fs::{DirBuilder, DirEntry, File, GenFS, Metadata, OpenOptions};
+    use fs::{DirBuilder, DirEntry as DirEntryTrait, File, GenFS, OpenOptions};
     use std::ffi::OsString;
     use std::io::Error;
     use std::sync::mpsc;
     use std::thread;
+    use unix_ext::*;
 
     fn errs_eq(l: Error, r: Error) -> bool {
         l.raw_os_error() == r.raw_os_error()
@@ -1244,7 +1296,7 @@ mod test {
 
         let fs = FS::with_mode(0o777);
         assert!(fs.new_dirbuilder().mode(0o666).create("lolz").is_ok());
-        assert!(fs.chmod("/", 0).is_ok());
+        assert!(fs.set_permissions("/", Permissions::from_mode(0)).is_ok());
         assert!(fs == exp);
     }
 
@@ -1292,7 +1344,7 @@ mod test {
                 let child_children = child_borrow.children.as_mut().unwrap();
                 child_children.insert(OsString::from("d"),
                                       Arc::new(RwLock::new(Directory {
-                                          mode: 0o775,
+                                          mode: 0o777,
                                           file: None,
                                           parent: Arc::downgrade(&child),
                                           children: Some(HashMap::new()),
@@ -1312,7 +1364,7 @@ mod test {
         assert!(fs.new_dirbuilder().mode(0o600).create("../b").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).create("c").is_ok());
         assert!(fs.cd("c").is_ok());
-        assert!(fs.new_dirbuilder().mode(0o775).create("d").is_ok());
+        assert!(fs.new_dirbuilder().mode(0o777).create("d").is_ok());
         assert!(fs == exp);
         assert!(fs.cd("..").is_ok());
         assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("a/z").unwrap_err(),
@@ -1336,10 +1388,10 @@ mod test {
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("a/b/c").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("/a/b/c/").is_ok());
         assert!(errs_eq(fs.new_dirbuilder()
-                            .mode(0o100)
-                            .recursive(true)
-                            .create("d/e/f")
-                            .unwrap_err(),
+                          .mode(0o100)
+                          .recursive(true)
+                          .create("d/e/f")
+                          .unwrap_err(),
                         EACCES()));
 
         let exp = FS::with_mode(0o300);
@@ -1350,16 +1402,16 @@ mod test {
         assert!(fs == exp);
 
         assert!(fs.cd("a/b/c").is_ok());
-        assert!(fs.chmod("..", 0o600).is_ok());
+        assert!(fs.set_permissions("..", Permissions::from_mode(0o600)).is_ok());
         assert!(errs_eq(fs.new_dirbuilder().mode(0o100).create("../../z").unwrap_err(),
                         EACCES()));
         assert!(errs_eq(fs.new_dirbuilder()
-                            .mode(0o100)
-                            .recursive(true)
-                            .create("../../z")
-                            .unwrap_err(),
+                          .mode(0o100)
+                          .recursive(true)
+                          .create("../../z")
+                          .unwrap_err(),
                         EACCES()));
-        assert!(exp.chmod("a/b", 0o600).is_ok());
+        assert!(exp.set_permissions("a/b", Permissions::from_mode(0o600)).is_ok());
         assert!(fs == exp);
     }
 
@@ -1389,7 +1441,7 @@ mod test {
 
         assert!(fs.new_dirbuilder().mode(0o100).create("unwrite").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("unexec/subdir").is_ok());
-        assert!(fs.chmod("unexec", 0o200).is_ok());
+        assert!(fs.set_permissions("unexec", Permissions::from_mode(0o200)).is_ok());
 
         assert!(errs_eq(fs.new_openopts().write(true).open("").unwrap_err(),
                         ENOENT()));
@@ -1406,14 +1458,14 @@ mod test {
                                      path: P,
                                      err: Option<Error>) {
             let res = fs.new_openopts()
-                .read(read)
-                .write(write)
-                .append(append)
-                .truncate(trunc)
-                .create_new(excl)
-                .create(create)
-                .mode(mode)
-                .open(&path);
+                        .read(read)
+                        .write(write)
+                        .append(append)
+                        .truncate(trunc)
+                        .create_new(excl)
+                        .create(create)
+                        .mode(mode)
+                        .open(&path);
 
             if err.is_some() {
                 if res.is_ok() {
@@ -1547,7 +1599,7 @@ mod test {
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("a/d/e").is_ok());
         assert!(fs.new_dirbuilder().mode(0o000).create("a/b").is_ok());
         assert!(fs.new_openopts().write(true).create(true).mode(0o400).open("a/c").is_ok());
-        assert!(fs.chmod("unexec", 0o200).is_ok());
+        assert!(fs.set_permissions("unexec", Permissions::from_mode(0o200)).is_ok());
 
         // ├--a/
         // |  ├--b/
@@ -1617,7 +1669,7 @@ mod test {
         let fs = FS::with_mode(0o700);
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("d/e").is_ok());
-        assert!(fs.chmod("a/b", 0o600).is_ok()); // cannot exec
+        assert!(fs.set_permissions("a/b", Permissions::from_mode(0o600)).is_ok()); // cannot exec
         assert!(fs.new_openopts().mode(0).write(true).create(true).open("f").is_ok());
         assert!(fs.new_openopts().mode(0).write(true).create(true).open("g").is_ok());
 
@@ -1641,7 +1693,7 @@ mod test {
 
         let exp = FS::with_mode(0o700);
         assert!(exp.new_dirbuilder().mode(0o700).recursive(true).create("d/e/b/c").is_ok());
-        assert!(exp.chmod("d/e/b", 0o600).is_ok());
+        assert!(exp.set_permissions("d/e/b", Permissions::from_mode(0o600)).is_ok());
         assert!(exp.new_openopts().mode(0).write(true).create(true).open("z").is_ok());
         assert!(fs == exp);
     }
@@ -1656,42 +1708,42 @@ mod test {
 
         let mut reader = fs.read_dir("a/b").unwrap();
         assert_eq!(reader.next().unwrap().unwrap(),
-                   super::DirEntry {
+                   DirEntry {
                        dir: PathBuf::from("a/b"),
                        base: OsString::from("c"),
-                       meta: super::Metadata {
-                           filetype: FileType::Dir,
+                       meta: Metadata {
+                           filetype: FileType { dir: true },
                            length: DIRLEN,
-                           perms: 0o700,
+                           perms: Permissions::from_mode(0o700),
                        },
                    });
         assert_eq!(reader.next().unwrap().unwrap(),
-                   super::DirEntry {
+                   DirEntry {
                        dir: PathBuf::from("a/b"),
                        base: OsString::from("d"),
-                       meta: super::Metadata {
-                           filetype: FileType::Dir,
+                       meta: Metadata {
+                           filetype: FileType { dir: true },
                            length: DIRLEN,
-                           perms: 0o300,
+                           perms: Permissions::from_mode(0o300),
                        },
                    });
         let next = reader.next().unwrap().unwrap();
         assert_eq!(next.path(), PathBuf::from("a/b/f"));
         assert_eq!(next.file_name(), OsString::from("f"));
         assert_eq!(next.metadata().unwrap(),
-                   super::Metadata {
-                       filetype: FileType::File,
+                   Metadata {
+                       filetype: FileType { dir: false },
                        length: 0,
-                       perms: 0,
+                       perms: Permissions::from_mode(0),
                    });
         let next = reader.next().unwrap().unwrap();
         assert_eq!(next.path(), PathBuf::from("a/b/z"));
         assert_eq!(next.file_name(), OsString::from("z"));
         assert_eq!(next.metadata().unwrap(),
-                   super::Metadata {
-                       filetype: FileType::Dir,
+                   Metadata {
+                       filetype: FileType { dir: true },
                        length: DIRLEN,
-                       perms: 0o100,
+                       perms: Permissions::from_mode(0o100),
                    });
         assert!(reader.next().is_none());
     }
