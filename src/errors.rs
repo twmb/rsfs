@@ -46,7 +46,7 @@ pub fn EISDIR() -> Error {
     Error::from_raw_os_error(21)
 }
 
-/// Used when performing an invalid operation (aka, a bad OpenOptions combination).
+/// Used when performing an invalid operation (aka, a bad `OpenOptions` combination).
 #[allow(non_snake_case)]
 pub fn EINVAL() -> Error {
     Error::from_raw_os_error(22)
