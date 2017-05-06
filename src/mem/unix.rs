@@ -408,7 +408,7 @@ pub struct ReadDir {
 impl ReadDir {
     // read_dir on every system I have ever used returns dirents in alphabetical order, so we will
     // recreate that behavior here.
-    fn new<P: AsRef<Path>>(path: P, dir: &Directory) -> Result<ReadDir> {
+    fn new<P: AsRef<Path>>(path: P, dir: &Dirent) -> Result<ReadDir> {
         // read_dir is about the only call that needs read permissions (and remove_dir_all below,
         // but only because that does not use read_dir).
         if !dir.readable() {
@@ -510,7 +510,7 @@ impl FS {
 
     /// Creates an empty `FS` with the given mode.
     pub fn with_mode(mode: u32) -> FS {
-        let pwd = Arc::new(RwLock::new(Directory {
+        let pwd = Arc::new(RwLock::new(Dirent {
             mode: mode,
             file: None,
             parent: Weak::new(),
@@ -619,22 +619,22 @@ impl fs::GenFS for FS {
     }
 }
 
-// Directory, which would be Dirent if DirEntry were not already taken, represents all information
+// Dirent, which would be Dirent if DirEntry were not already taken, represents all information
 // needed at a node in our filesystem tree.
 //
-// A Directory is either a file OR a children, not both and not neither, but it seemed more
+// A Dirent is either a file OR a children, not both and not neither, but it seemed more
 // uglier than it was worth to combine both of those into an enum.
 #[derive(Debug)]
-struct Directory {
+struct Dirent {
     mode: u32,
 
     file: Option<Arc<RwLock<RawFile>>>,
 
-    parent: Weak<RwLock<Directory>>,
-    children: Option<HashMap<OsString, Arc<RwLock<Directory>>>>,
+    parent: Weak<RwLock<Dirent>>,
+    children: Option<HashMap<OsString, Arc<RwLock<Dirent>>>>,
 }
 
-impl Directory {
+impl Dirent {
     fn is_dir(&self) -> bool {
         self.file.is_none()
     }
@@ -652,8 +652,8 @@ impl Directory {
 // FileSystem is a single in-memory filesystem that can be used cloned and passed around safely.
 #[derive(Debug)]
 struct FileSystem {
-    root: Arc<RwLock<Directory>>,
-    pwd: Arc<RwLock<Directory>>,
+    root: Arc<RwLock<Dirent>>,
+    pwd: Arc<RwLock<Dirent>>,
 }
 
 fn path_empty<P: AsRef<Path>>(path: P) -> bool {
@@ -664,7 +664,7 @@ fn path_empty<P: AsRef<Path>>(path: P) -> bool {
 // currently does not validate file contents.
 impl PartialEq for FileSystem {
     fn eq(&self, other: &FileSystem) -> bool {
-        fn eq_at(l: Arc<RwLock<Directory>>, r: Arc<RwLock<Directory>>) -> bool {
+        fn eq_at(l: Arc<RwLock<Dirent>>, r: Arc<RwLock<Dirent>>) -> bool {
             let bl = l.read();
             let br = r.read();
             if bl.mode != br.mode {
@@ -704,13 +704,13 @@ impl FileSystem {
     // (exec) the parent directory.
     fn up_path(&self,
                parts: path_parts::Parts)
-               -> Result<(Arc<RwLock<Directory>>, path_parts::Parts)> {
+               -> Result<(Arc<RwLock<Dirent>>, path_parts::Parts)> {
         // If the parts begin at root, they will have no ParentDirs. We go up and return at root.
         if parts.at_root() {
             return Ok((self.root.clone(), parts));
         }
 
-        // `up` is what we return: the Arc<Directory> after traversing up all ParentDirs in `parts`.
+        // `up` is what we return: the Arc<Dirent> after traversing up all ParentDirs in `parts`.
         let mut up = self.pwd.clone();
         let mut parts_iter = parts.into_iter().peekable();
         while parts_iter.peek()
@@ -744,7 +744,7 @@ impl FileSystem {
     // a directory).
     fn traverse(&self,
                 parts: path_parts::Parts)
-                -> Result<(Arc<RwLock<Directory>>, Option<OsString>)> {
+                -> Result<(Arc<RwLock<Dirent>>, Option<OsString>)> {
         let (mut fs, parts) = self.up_path(parts)?;
         let mut parts_iter = parts.into_iter().peek2able();
         while parts_iter.peek2().is_some() {
@@ -845,7 +845,7 @@ impl FileSystem {
                 Err(EEXIST())
             }
             Entry::Vacant(v) => {
-                v.insert(Arc::new(RwLock::new(Directory {
+                v.insert(Arc::new(RwLock::new(Dirent {
                     mode: mode,
                     file: None,
                     parent: Arc::downgrade(&fs),
@@ -987,7 +987,7 @@ impl FileSystem {
         // read_dir to recurse, which requires `ls`. Standard linux is able to remove empty
         // directories with only write and execute privileges. This code attempts to mimic what
         // Rust will do.
-        fn recursive_remove(fs: Arc<RwLock<Directory>>) -> Result<()> {
+        fn recursive_remove(fs: Arc<RwLock<Dirent>>) -> Result<()> {
             if fs.read().children.is_some() {
                 let mut borrow = fs.write();
                 if !borrow.readable() || !borrow.executable() || !borrow.writable() {
@@ -1169,7 +1169,7 @@ impl FileSystem {
             valid: true,
             data: Vec::new(),
         }));
-        let child = Arc::new(RwLock::new(Directory {
+        let child = Arc::new(RwLock::new(Dirent {
             mode: options.mode,
             file: Some(file.clone()),
             parent: Arc::downgrade(&fs),
@@ -1193,7 +1193,7 @@ impl FileSystem {
 
 // `open_existing` opens known existing file with the given options, returning an error if the file
 // cannot be opened with those options.
-fn open_existing(fs: &Arc<RwLock<Directory>>, options: &OpenOptions) -> Result<File> {
+fn open_existing(fs: &Arc<RwLock<Dirent>>, options: &OpenOptions) -> Result<File> {
     if options.excl {
         return Err(EEXIST());
     }
@@ -1266,7 +1266,7 @@ mod test {
 
     #[test]
     fn equal() {
-        let exp_pwd = Arc::new(RwLock::new(Directory {
+        let exp_pwd = Arc::new(RwLock::new(Dirent {
             mode: 0o0,
             file: None,
             parent: Weak::new(),
@@ -1286,7 +1286,7 @@ mod test {
                 .as_mut()
                 .unwrap()
                 .insert(OsString::from("lolz"),
-                        Arc::new(RwLock::new(Directory {
+                        Arc::new(RwLock::new(Dirent {
                             mode: 0o666,
                             file: None,
                             parent: Arc::downgrade(&root),
@@ -1302,7 +1302,7 @@ mod test {
 
     #[test]
     fn mkdir() {
-        let exp_pwd = Arc::new(RwLock::new(Directory {
+        let exp_pwd = Arc::new(RwLock::new(Dirent {
             mode: 0o300,
             file: None,
             parent: Weak::new(),
@@ -1320,20 +1320,20 @@ mod test {
             let mut borrow = root.write();
             let children = borrow.children.as_mut().unwrap();
             children.insert(OsString::from("a"),
-                            Arc::new(RwLock::new(Directory {
+                            Arc::new(RwLock::new(Dirent {
                                 mode: 0o500, // r-x: cannot create subfiles
                                 file: None,
                                 parent: Arc::downgrade(&root),
                                 children: Some(HashMap::new()),
                             })));
             children.insert(OsString::from("b"),
-                            Arc::new(RwLock::new(Directory {
+                            Arc::new(RwLock::new(Dirent {
                                 mode: 0o600, // rw-: cannot exec (cd) into to create subfiles
                                 file: None,
                                 parent: Arc::downgrade(&root),
                                 children: Some(HashMap::new()),
                             })));
-            let child = Arc::new(RwLock::new(Directory {
+            let child = Arc::new(RwLock::new(Dirent {
                 mode: 0o300, // _wx: all we need
                 file: None,
                 parent: Arc::downgrade(&root),
@@ -1343,7 +1343,7 @@ mod test {
                 let mut child_borrow = child.write();
                 let child_children = child_borrow.children.as_mut().unwrap();
                 child_children.insert(OsString::from("d"),
-                                      Arc::new(RwLock::new(Directory {
+                                      Arc::new(RwLock::new(Dirent {
                                           mode: 0o777,
                                           file: None,
                                           parent: Arc::downgrade(&child),
@@ -1426,7 +1426,7 @@ mod test {
                 .as_mut()
                 .unwrap()
                 .insert(OsString::from("a"),
-                        Arc::new(RwLock::new(Directory {
+                        Arc::new(RwLock::new(Dirent {
                             mode: 0o300,
                             file: Some(Arc::new(RwLock::new(RawFile {
                                 valid: true,
