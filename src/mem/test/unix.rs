@@ -9,229 +9,196 @@
 //! sequence of closures is drained as they return `Some(Result)`; if a closure returns `None`, the
 //! closure is not drained from the sequence.
 //!
-//! While I believe the API is already useful, I can imagine many ways this could be improved to
-//! add more exact error injection to cause more precise cascading failures. These additions will
-//! likely be API changing. Versions under 1 may see some of this change, but after 1.0, I will
-//! increment the major version as the API changes.
-//!
-//! # Example
-//!
-//! ```
-//! use rsfs::*;
-//! use rsfs::errors::*;
-//! use rsfs::unix_ext::*;
-//! use rsfs::mem::test::fs::{FS, InKind, AtFile};
-//! use std::io::{Read, Result, Seek, SeekFrom, Write};
-//!
-//! let fs = FS::with_mode(0o300);
-//!
-//! // push a sequence that we want to trigger failure on:
-//! // a successful read followed by a failure.
-//!
-//! fs.push_sequence(vec![Box::new(|k: InKind| -> Option<Result<()>> { // successful first
-//!                           if k == InKind::File(AtFile::Read) {
-//!                               return Some(Ok(()));
-//!                           }
-//!                           None
-//!                       }),
-//!                       Box::new(|k: InKind| -> Option<Result<()>> { // failing second
-//!                           if k == InKind::File(AtFile::Read) {
-//!                               return Some(Err(ENOENT()));
-//!                           }
-//!                           None
-//!                       })]);
-//!
-//! // open a file, write some content...
-//! let mut wf =
-//!     fs.new_openopts().mode(0o600).write(true).create_new(true).open("f").unwrap();
-//! assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
-//!
-//! // open the file for reading...
-//! let mut rf = fs.new_openopts().read(true).open("f").unwrap();
-//!
-//! // read some content, consuming the first closure in the sequence...
-//! let mut output = [0u8; 4];
-//! assert_eq!(rf.read(&mut output).unwrap(), 4);
-//! assert_eq!(&output, &[0, 1, 2, 3]);
-//!
-//! // notice that other file operations will not fail
-//! assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-//!
-//! // consume the second closure, which will error...
-//! assert!(rf.read(&mut output).is_err());
-//!
-//! // now we are back to normal and that same read will be successful...
-//! assert_eq!(rf.read(&mut output).unwrap(), 4);
-//! assert_eq!(&output, &[1, 2, 3, 4]);
-//! ```
-//!
-//! [`FS`]: struct.FS.html
-//! [`mem`]: ../mem/index.html
 
-// TODO: I think it would be good for the enums to also take references to the arguments of the
-// function the enums are used in, which would allow for exact matching for APIs to use when
-// determining whether an error should occur.
-// Additionally, it would be super useful to trigger partial reads or writes.
+// # Example
+//
+// ```
+// use rsfs::*;
+// use rsfs::errors::*;
+// use rsfs::unix_ext::*;
+// use rsfs::mem::test::fs::{FS, In, AtFile};
+// use std::io::{Read, Result, Seek, SeekFrom, Write};
+//
+// let fs = FS::with_mode(0o300);
+//
+//
+// // open a file, write some content...
+// let mut wf =
+//     fs.new_openopts().mode(0o600).write(true).create_new(true).open("f").unwrap();
+// assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
+//
+// // open the file for reading...
+// let mut rf = fs.new_openopts().read(true).open("f").unwrap();
+//
+// // read some content, consuming the first closure in the sequence...
+// let mut output = [0u8; 4];
+// assert_eq!(rf.read(&mut output).unwrap(), 4);
+// assert_eq!(&output, &[0, 1, 2, 3]);
+//
+// // notice that other file operations will not fail
+// assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
+//
+// // consume the second closure, which will error...
+// assert!(rf.read(&mut output).is_err());
+//
+// // now we are back to normal and that same read will be successful...
+// assert_eq!(rf.read(&mut output).unwrap(), 4);
+// assert_eq!(&output, &[1, 2, 3, 4]);
+// ```
+//
+// [`FS`]: struct.FS.html
+// [`mem`]: ../mem/index.html
+//
 
 extern crate parking_lot;
+
+use std::cmp;
+use std::ffi::OsString;
+use std::io::{Read, Result, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use self::parking_lot::Mutex;
 
 use fs;
 use mem::fs as mem;
-
-use std::collections::VecDeque;
-use std::ffi::OsString;
-use std::io::{Read, Result, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use unix_ext;
-
-/// The `testfs` is about to call a [`File`] method.
-///
-/// [`File`]: ../fs/trait.File.html
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum AtFile {
-    /// The next call will be [`read`].
-    ///
-    /// [`read`]: https://doc.rust-lang.org/nightly/std/io/trait.Read.html#tymethod.read
-    Read,
-    /// The next call will be [`write`].
-    ///
-    /// [`write`]: https://doc.rust-lang.org/nightly/std/io/trait.Write.html#tymethod.write
-    Write,
-    /// The next call will be [`flush`].
-    ///
-    /// [`flush`]: https://doc.rust-lang.org/nightly/std/io/trait.Write.html#tymethod.flush
-    Flush,
-    /// The next call will be [`seek`].
-    ///
-    /// [`seek`]: https://doc.rust-lang.org/std/io/trait.Seek.html#tymethod.seek
-    Seek,
-    /// The next call will be [`metadata`].
-    ///
-    /// [`metadata`]: ../fs/trait.File.html#tymethod.metadata
-    Metadata,
-}
-
-/// The `testfs` is about to call an [`OpenOptions`] method.
-///
-/// [`OpenOptions`]: ../fs/trait.OpenOptions.html
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum AtOpenOpts {
-    /// The next call will be [`open`].
-    ///
-    /// [`open`]: ../fs/trait.OpenOptions.html#tymethod.open
-    Open,
-}
 
 /// The `testfs` is about to call a [`DirBuilder`] method.
 ///
 /// [`DirBuilder`]: ../fs/trait.DirBuilder.html
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum AtDirBuilder {
+pub enum AtDirBuilder<'inj: 'p, 'p> {
     /// The next call will be [`create`].
     ///
     /// [`create`]: ../fs/trait.DirBuilder.html#tymethod.create
-    Create,
+    Create(&'p DirBuilder<'inj>, &'p PathBuf),
 }
 
 /// The `testfs` is about to call a [`DirEntry`] method.
 ///
 /// [`DirEntry`]: ../fs/trait.DirEntry.html
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum AtDirEntry {
+pub enum AtDirEntry<'inj: 'p, 'p> {
     /// The next call will be [`metadata`].
     ///
     /// [`metadata`]: ../fs/trait.DirEntry.html#tymethod.metadata
-    Metadata,
+    Metadata(&'p DirEntry<'inj>),
     /// The next call will be [`file_type`].
     ///
     /// [`file_type`]: ../fs/trait.DirEntry.html#tymethod.file_type
-    FileType,
+    FileType(&'p DirEntry<'inj>),
+}
+
+/// The `testfs` is about to call a [`File`] method.
+///
+/// [`File`]: ../fs/trait.File.html
+pub enum AtFile<'inj: 'p, 'p> {
+    /// The next call will be [`metadata`].
+    ///
+    /// [`metadata`]: ../fs/trait.File.html#tymethod.metadata
+    Metadata(&'p File<'inj>),
+    /// The next call will be [`flush`].
+    ///
+    /// [`flush`]: https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush
+    Flush(&'p File<'inj>),
+    /// The next call will be [`seek`].
+    ///
+    /// [`seek`]: https://doc.rust-lang.org/std/io/trait.Seek.html#tymethod.seek
+    Seek(&'p File<'inj>, &'p SeekFrom),
+}
+
+pub enum AtFilePartial<'inj: 'p, 'p> {
+    Read(&'p File<'inj>, &'p [u8]),
+    Write(&'p File<'inj>, &'p [u8]),
+}
+
+/// The `testfs` is about to call an [`OpenOptions`] method.
+///
+/// [`OpenOptions`]: ../fs/trait.OpenOptions.html
+pub enum AtOpenOptions<'inj: 'p, 'p> {
+    /// The next call will be [`open`].
+    ///
+    /// [`open`]: ../fs/trait.OpenOptions.html#tymethod.open
+    Open(&'p OpenOptions<'inj>, &'p PathBuf),
 }
 
 /// The `testfs` is about to call a [`ReadDir`] method.
 ///
 /// [`ReadDir`]: ../fs/trait.ReadDir.html
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum AtReadDir {
+pub enum AtReadDir<'inj: 'p, 'p> {
     /// The next call will be [`next`].
     ///
     /// [`next`]: https://doc.rust-lang.org/std/iter/trait.Iterator.html#tymethod.next
-    Next,
+    Next(&'p ReadDir<'inj>),
 }
 
 /// The `testfs` is about to call an [`FS`] method.
 ///
 /// [`FS`]: ../fs/trait.FS.html
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum AtFS {
+pub enum AtFS<'p> {
     /// The next call will be [`metadata`].
     ///
     /// [`metadata`]: ../fs/trait.FS.html#tymethod.metadata
-    Metadata,
+    Metadata(&'p PathBuf),
     /// The next call will be [`read_dir`].
     ///
     /// [`read_dir`]: ../fs/trait.FS.html#tymethod.read_dir
-    ReadDir,
+    ReadDir(&'p PathBuf),
     /// The next call will be [`remove_dir`].
     ///
     /// [`remove_dir`]: ../fs/trait.FS.html#tymethod.remove_dir
-    RemoveDir,
+    RemoveDir(&'p PathBuf),
     /// The next call will be [`remove_dir_all`].
     ///
     /// [`remove_dir_all`]: ../fs/trait.FS.html#tymethod.remove_dir_all
-    RemoveDirAll,
+    RemoveDirAll(&'p PathBuf),
     /// The next call will be [`remove_file`].
     ///
     /// [`remove_file`]: ../fs/trait.FS.html#tymethod.remove_file
-    RemoveFile,
+    RemoveFile(&'p PathBuf),
     /// The next call will be [`rename`].
     ///
     /// [`rename`]: ../fs/trait.FS.html#tymethod.rename
-    Rename,
+    Rename(&'p PathBuf, &'p PathBuf),
     /// The next call will be [`set_permissions`].
     ///
     /// [`set_permissions`]: ../fs/trait.FS.html#tymethod.set_permissions
-    SetPermissions,
+    SetPermissions(&'p PathBuf, &'p mem::Permissions),
 }
 
 /// The `testfs` is about to call a method that can error.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum InKind {
-    /// The `testfs` is about to call a [`File`] method. See the [`AtFile`] enum.
-    ///
-    /// [`File`]: ../fs/trait.File.html
-    /// [`AtFile`]: enum.AtFile.html
-    File(AtFile),
-    /// The `testfs` is about to call an [`OpenOptions`] method. See the
-    /// [`AtOpenOptions`] enum.
-    ///
-    /// [`OpenOptions`]: ../fs/trait.OpenOptions.html
-    /// [`AtOpenOptions`]: enum.AtOpenOptions.html
-    OpenOptions(AtOpenOpts),
+pub enum In<'inj: 'p, 'p> {
     /// The `testfs` is about to call a [`DirBuilder`] method. See the [`AtDirBuilder`]
     /// enum.
     ///
     /// [`DirBuilder`]: ../fs/trait.DirBuilder.html
     /// [`AtDirBuilder`]: enum.AtDirBuilder.html
-    DirBuilder(AtDirBuilder),
+    DirBuilder(AtDirBuilder<'inj, 'p>),
     /// The `testfs` is about to call a [`DirEntry`] method. See the [`AtDirEntry`] enum.
     ///
     /// [`DirEntry`]: ../fs/trait.DirEntry.html
     /// [`AtDirEntry`]: enum.AtDirEntry.html
-    DirEntry(AtDirEntry),
+    DirEntry(AtDirEntry<'inj, 'p>),
+    /// The `testfs` is about to call a [`File`] method. See the [`AtFile`] enum.
+    ///
+    /// [`File`]: ../fs/trait.File.html
+    /// [`AtFile`]: enum.AtFile.html
+    File(AtFile<'inj, 'p>),
+    /// The `testfs` is about to call an [`OpenOptions`] method. See the
+    /// [`AtOpenOptions`] enum.
+    ///
+    /// [`OpenOptions`]: ../fs/trait.OpenOptions.html
+    /// [`AtOpenOptions`]: enum.AtOpenOptions.html
+    OpenOptions(AtOpenOptions<'inj, 'p>),
     /// The `testfs` is about to call a [`ReadDir`] method. See the [`AtReadDir`] enum.
     ///
     /// [`ReadDir`]: ../fs/trait.ReadDir.html
     /// [`AtReadDir`]: enum.AtReadDir.html
-    ReadDir(AtReadDir),
+    ReadDir(AtReadDir<'inj, 'p>),
     /// The `testfs` is about to call an [`FS`] method. See the [`AtFS`] enum.
     ///
     /// [`FS`]: ../fs/trait.FS.html
     /// [`AtFS`]: enum.AtFS.html
-    FS(AtFS),
+    FS(AtFS<'p>),
 }
 
 /// A builder used to create directories in various manners.
@@ -242,23 +209,30 @@ pub enum InKind {
 /// [`mem::DirBuilder`]: ../mem/struct.DirBuilder.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct DirBuilder {
-    seq: ResultSeq,
-    inner: mem::DirBuilder,
+pub struct DirBuilder<'inj> {
+    injector: InjectFn<'inj>,
+    pub inner: mem::DirBuilder,
 }
 
-impl fs::DirBuilder for DirBuilder {
+impl<'inj> fs::DirBuilder for DirBuilder<'inj> {
     fn recursive(&mut self, recursive: bool) -> &mut Self {
         self.inner.recursive(recursive);
         self
     }
     fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.seq.maybe_seq(InKind::DirBuilder(AtDirBuilder::Create))?;
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| {
+                        f(In::DirBuilder(AtDirBuilder::Create(self, &path.as_ref().to_owned())))
+                    }) {
+            r?;
+        }
         self.inner.create(path)
     }
 }
 
-impl unix_ext::DirBuilderExt for DirBuilder {
+impl<'inj> unix_ext::DirBuilderExt for DirBuilder<'inj> {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.inner.mode(mode);
         self
@@ -274,12 +248,12 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 /// [`mem::DirEntry`]: ../mem/struct.DirEntry.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct DirEntry {
-    seq: ResultSeq,
-    inner: mem::DirEntry,
+pub struct DirEntry<'inj> {
+    injector: InjectFn<'inj>,
+    pub inner: mem::DirEntry,
 }
 
-impl fs::DirEntry for DirEntry {
+impl<'inj> fs::DirEntry for DirEntry<'inj> {
     type Metadata = mem::Metadata;
     type FileType = mem::FileType;
 
@@ -287,11 +261,21 @@ impl fs::DirEntry for DirEntry {
         self.inner.path()
     }
     fn metadata(&self) -> Result<Self::Metadata> {
-        self.seq.maybe_seq(InKind::DirEntry(AtDirEntry::Metadata))?;
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::DirEntry(AtDirEntry::Metadata(self)))) {
+            r?;
+        }
         self.inner.metadata()
     }
     fn file_type(&self) -> Result<Self::FileType> {
-        self.seq.maybe_seq(InKind::DirEntry(AtDirEntry::FileType))?;
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::DirEntry(AtDirEntry::FileType(self)))) {
+            r?;
+        }
         self.inner.file_type()
     }
     fn file_name(&self) -> OsString {
@@ -307,41 +291,65 @@ impl fs::DirEntry for DirEntry {
 /// [`mem::File`]: ../mem/struct.File.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct File {
-    seq: ResultSeq,
+pub struct File<'inj> {
+    injector: InjectFn<'inj>,
+    file_injector: InjectFilePartialFn<'inj>,
     inner: mem::File,
 }
 
-impl fs::File for File {
+impl<'inj> fs::File for File<'inj> {
     type Metadata = mem::Metadata;
 
     fn metadata(&self) -> Result<Self::Metadata> {
-        self.seq.maybe_seq(InKind::File(AtFile::Metadata))?;
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::File(AtFile::Metadata(self)))) {
+            r?;
+        }
         self.inner.metadata()
     }
 }
 
-impl Read for File {
+impl<'inj> Read for File<'inj> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.seq.maybe_seq(InKind::File(AtFile::Read))?;
-        self.inner.read(buf)
+        let mut injector = self.file_injector.lock(); // always hold for the entire fn
+        // The injector may return Ok, but that we should read a small number of bytes.
+        let mut sz = buf.len();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(AtFilePartial::Read(self, buf))) {
+            sz = cmp::min(r?, buf.len());
+        }
+        self.inner.read(&mut buf[..sz])
     }
 }
 
-impl Write for File {
+impl<'inj> Write for File<'inj> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.seq.maybe_seq(InKind::File(AtFile::Write))?;
-        self.inner.write(buf)
+        let mut injector = self.file_injector.lock(); // always hold for the entire fn
+        // The injector may return Ok, but that we should write a small number of bytes.
+        let mut sz = buf.len();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(AtFilePartial::Write(self, buf))) {
+            sz = cmp::min(r?, buf.len());
+        }
+        self.inner.write(&buf[..sz])
     }
     fn flush(&mut self) -> Result<()> {
-        self.seq.maybe_seq(InKind::File(AtFile::Flush))?;
         self.inner.flush()
     }
 }
 
-impl Seek for File {
+impl<'inj> Seek for File<'inj> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-        self.seq.maybe_seq(InKind::File(AtFile::Seek))?;
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::File(AtFile::Seek(self, &pos)))) {
+            r?;
+        }
         self.inner.seek(pos)
     }
 }
@@ -354,13 +362,14 @@ impl Seek for File {
 /// [`mem::OpenOptions`]: ../mem/struct.OpenOptions.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct OpenOptions {
-    seq: ResultSeq,
+pub struct OpenOptions<'inj> {
+    injector: InjectFn<'inj>,
+    file_injector: InjectFilePartialFn<'inj>,
     inner: mem::OpenOptions,
 }
 
-impl fs::OpenOptions for OpenOptions {
-    type File = File;
+impl<'inj> fs::OpenOptions for OpenOptions<'inj> {
+    type File = File<'inj>;
 
     fn read(&mut self, read: bool) -> &mut Self {
         self.inner.read(read);
@@ -387,17 +396,28 @@ impl fs::OpenOptions for OpenOptions {
         self
     }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
-        self.seq.maybe_seq(InKind::OpenOptions(AtOpenOpts::Open))?;
-        self.inner.open(path).map(|f| {
-            File {
-                seq: self.seq.clone(),
-                inner: f,
-            }
-        })
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| {
+                        f(In::OpenOptions(AtOpenOptions::Open(self, &path.as_ref().to_owned())))
+                    }) {
+            r?;
+        }
+
+        self.inner
+            .open(path)
+            .map(|f| {
+                     File {
+                         injector: self.injector.clone(),
+                         file_injector: self.file_injector.clone(),
+                         inner: f,
+                     }
+                 })
     }
 }
 
-impl unix_ext::OpenOptionsExt for OpenOptions {
+impl<'inj> unix_ext::OpenOptionsExt for OpenOptions<'inj> {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.inner.mode(mode);
         self
@@ -412,46 +432,43 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
 /// [`mem::ReadDir`]: ../mem/struct.ReadDir.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct ReadDir {
-    seq: ResultSeq,
+pub struct ReadDir<'inj> {
+    injector: InjectFn<'inj>,
     inner: mem::ReadDir,
 }
 
-impl Iterator for ReadDir {
-    type Item = Result<DirEntry>;
+impl<'inj> Iterator for ReadDir<'inj> {
+    type Item = Result<DirEntry<'inj>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Err(e) = self.seq.maybe_seq(InKind::ReadDir(AtReadDir::Next)) {
-            return Some(Err(e));
-        }
-        self.inner.next().map(|res| {
-            res.map(|dirent| {
-                DirEntry {
-                    seq: self.seq.clone(),
-                    inner: dirent,
-                }
-            })
-        })
-    }
-}
-
-#[derive(Clone)]
-struct ResultSeq(Arc<Mutex<VecDeque<Box<Fn(InKind) -> Option<Result<()>>>>>>); // >>>>>>>>>>>
-
-impl ResultSeq {
-    // maybe_seq calls the front sequence closure if it exists and, if that closure returned
-    // something, pops the front and returns that something.
-    fn maybe_seq(&self, in_kind: InKind) -> Result<()> {
-        let mut seq = self.0.lock();
-        match seq.front().map_or(None, |seq| seq(in_kind)) {
-            Some(res) => {
-                seq.pop_front();
-                res
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::ReadDir(AtReadDir::Next(self)))) {
+            if r.is_err() {
+                return Some(Err(r.unwrap_err()));
             }
-            None => Ok(()),
         }
+
+        self.inner
+            .next()
+            .map(|res| {
+                     res.map(|dirent| {
+                                 DirEntry {
+                                     injector: self.injector.clone(),
+                                     inner: dirent,
+                                 }
+                             })
+                 })
     }
 }
+
+type InjectFn<'inj> = Arc<Mutex<MaybeInjectFn<'inj>>>;
+type InjectFilePartialFn<'inj> = Arc<Mutex<MaybeInjectFilePartialFn<'inj>>>;
+
+pub type MaybeInjectFn<'inj> = Option<Box<&'inj mut FnMut(In) -> Result<()>>>;
+pub type MaybeInjectFilePartialFn<'inj> = Option<Box<&'inj mut FnMut(AtFilePartial)
+                                                                     -> Result<usize>>>;
 
 /// An in memory struct that satisfies [`rsfs::FS`] and allows for injectable errors.
 ///
@@ -465,31 +482,32 @@ impl ResultSeq {
 /// [`mem::FS`]: ../mem/struct.FS.html
 /// [documentation]: index.html
 #[derive(Clone)]
-pub struct FS {
-    seq: ResultSeq,
+pub struct FS<'inj> {
+    injector: InjectFn<'inj>,
+    file_injector: InjectFilePartialFn<'inj>,
     inner: mem::FS,
 }
 
-impl FS {
+impl<'inj> FS<'inj> {
     /// Creates an empty `FS` with mode `0o777`.
-    pub fn new() -> FS {
+    pub fn new() -> FS<'inj> {
         Self::with_mode(0o777)
     }
 
     /// Creates an empty `FS` with the given mode.
-    pub fn with_mode(mode: u32) -> FS {
+    pub fn with_mode(mode: u32) -> FS<'inj> {
         FS {
-            seq: ResultSeq(Arc::new(Mutex::new(VecDeque::new()))),
+            injector: Arc::new(Mutex::new(None)),
+            file_injector: Arc::new(Mutex::new(None)),
             inner: mem::FS::with_mode(mode),
         }
     }
 
     /// Changes the current working directory of the filesytsem.
     ///
-    /// This call simply calls [`cd`] on the wrapped [`mem::FS`].
-    ///
-    /// NOTE: This does not consume from sequence errors as this should only be used while setting
-    /// up a test filesystem.
+    /// This call simply calls [`cd`] on the wrapped [`mem::FS`]. Because this is a function whose
+    /// intent is only to setup a test filesystem, it is not possible to inject errors into this
+    /// call.
     ///
     /// [`cd`]: ../mem/struct.FS.html#method.cd
     /// [`mem::FS`]: ../mem/struct.FS.html
@@ -497,152 +515,180 @@ impl FS {
         self.inner.cd(path)
     }
 
-    /// Pushes a sequence of closures to run on future operations that return `Result`.
-    ///
-    /// On every filesystem call that returns `Result`, a `testfs` checks the head of an internal
-    /// sequence of closures. If one exists, it calls that closure with an enum signalling what
-    /// call it is about to perform. With this information, the closure can return whether that
-    /// operation should fail and if so, with what error.
-    ///
-    /// Closures in the sequence are only consumed once they return `Some` value. By returning a
-    /// series of `Some` values, this sequence can trigger cascading errors during testing that
-    /// normally are untestable.
-    ///
-    /// See the module [documentation] for an example.
-    ///
-    /// [documentation]: index.html
-    pub fn push_sequence(&self, seq: Vec<Box<Fn(InKind) -> Option<Result<()>>>>) {
-        let mut existing = self.seq.0.lock();
-        for c in seq {
-            existing.push_back(c);
-        }
+    pub fn set_inject_fn(&mut self, f: MaybeInjectFn<'inj>) {
+        *self.injector.lock() = f
     }
 
-    /// Clears the internal sequence of errors, if any.
-    ///
-    /// Future operations will proceed as normal unless more errors are injected.
-    pub fn clear_sequence(&self) {
-        self.seq.0.lock().clear()
+    pub fn set_inject_file_partial_fn(&mut self, f: MaybeInjectFilePartialFn<'inj>) {
+        *self.file_injector.lock() = f
     }
 }
 
-impl fs::GenFS for FS {
-    type DirBuilder = DirBuilder;
-    type DirEntry = DirEntry;
+impl<'inj> fs::GenFS for FS<'inj> {
+    type DirBuilder = DirBuilder<'inj>;
+    type DirEntry = DirEntry<'inj>;
     type Metadata = mem::Metadata;
-    type OpenOptions = OpenOptions;
+    type OpenOptions = OpenOptions<'inj>;
     type Permissions = mem::Permissions;
-    type ReadDir = ReadDir;
+    type ReadDir = ReadDir<'inj>;
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<mem::Metadata> {
-        self.seq.maybe_seq(InKind::FS(AtFS::Metadata))?;
+        let mut injector = self.injector.lock();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::FS(AtFS::Metadata(&path.as_ref().to_owned())))) {
+            r?
+        }
         self.inner.metadata(path)
     }
-    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
-        self.seq.maybe_seq(InKind::FS(AtFS::ReadDir))?;
-        let res = self.inner.read_dir(path)?;
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir<'inj>> {
+        let mut injector = self.injector.lock();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::FS(AtFS::ReadDir(&path.as_ref().to_owned())))) {
+            r?
+        }
         Ok(ReadDir {
-            seq: self.seq.clone(),
-            inner: res,
-        })
+               injector: self.injector.clone(),
+               inner: self.inner.read_dir(path)?,
+           })
     }
+
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.seq.maybe_seq(InKind::FS(AtFS::RemoveDir))?;
+        let mut injector = self.injector.lock();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::FS(AtFS::RemoveDir(&path.as_ref().to_owned())))) {
+            r?
+        }
         self.inner.remove_dir(path)
     }
+
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.seq.maybe_seq(InKind::FS(AtFS::RemoveDirAll))?;
+        let mut injector = self.injector.lock();
+        if let Some(r) = injector
+                         .as_mut()
+                         .map(|f| {
+                             f(In::FS(AtFS::RemoveDirAll(
+                                         &path.as_ref().to_owned())))
+                         }) {
+            r?
+        }
         self.inner.remove_dir_all(path)
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.seq.maybe_seq(InKind::FS(AtFS::RemoveFile))?;
+        let mut injector = self.injector.lock();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| f(In::FS(AtFS::RemoveFile(&path.as_ref().to_owned())))) {
+            r?
+        }
         self.inner.remove_file(path)
     }
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        self.seq.maybe_seq(InKind::FS(AtFS::Rename))?;
+        let mut injector = self.injector.lock();
+        if let Some(r) = injector
+               .as_mut()
+               .map(|f| {
+                        f(In::FS(AtFS::Rename(&from.as_ref().to_owned(),
+                                                  &to.as_ref().to_owned())))
+                    }) {
+            r?
+        }
         self.inner.rename(from, to)
     }
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
-        self.seq.maybe_seq(InKind::FS(AtFS::SetPermissions))?;
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FS(AtFS::SetPermissions(&path.as_ref().to_owned(), &perm)))) {
+            r?
+        }
         self.inner.set_permissions(path, perm)
     }
-    fn new_openopts(&self) -> OpenOptions {
+    fn new_openopts(&self) -> OpenOptions<'inj> {
         OpenOptions {
-            seq: self.seq.clone(),
+            injector: self.injector.clone(),
+            file_injector: self.file_injector.clone(),
             inner: self.inner.new_openopts(),
         }
     }
-    fn new_dirbuilder(&self) -> DirBuilder {
+    fn new_dirbuilder(&self) -> DirBuilder<'inj> {
         DirBuilder {
-            seq: self.seq.clone(),
+            injector: self.injector.clone(),
             inner: self.inner.new_dirbuilder(),
         }
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use errors::*;
-    use fs::{DirBuilder, GenFS, OpenOptions};
-    use std::io::{Error, Read, Seek, SeekFrom, Write};
-    use unix_ext::*;
-
-    fn errs_eq(l: Error, r: Error) -> bool {
-        l.raw_os_error() == r.raw_os_error()
-    }
-
-    #[test]
-    fn basic() {
-        let fs = FS::with_mode(0o300);
-        assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
-
-        // Push a few errors (rustfmt makes this hideous)...
-        fs.push_sequence(vec![// Fail creating a directory...
-                              Box::new(|k: InKind| -> Option<Result<()>> {
-            match k {
-                InKind::DirBuilder(AtDirBuilder::Create) => Some(Err(ENOENT())),
-                _ => None,
-            }
-        }),
-                              // After which, one read must succeed.
-                              Box::new(|k: InKind| -> Option<Result<()>> {
-                                  match k {
-                                      InKind::File(AtFile::Read) => Some(Ok(())),
-                                      _ => None,
-                                  }
-                              }),
-                              // Then fail the next read.
-                              Box::new(|k: InKind| -> Option<Result<()>> {
-                                  match k {
-                                      InKind::File(AtFile::Read) => Some(Err(EACCES())),
-                                      _ => None,
-                                  }
-                              })]);
-
-        // open a file, write some content...
-        let mut wf =
-            fs.new_openopts().mode(0o600).write(true).create_new(true).open("a/f").unwrap();
-        assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
-
-        // open the file for reading, read some content...
-        let mut rf = fs.new_openopts().read(true).open("a/f").unwrap();
-        assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-
-        let mut output = [0u8; 4];
-        assert_eq!(rf.read(&mut output).unwrap(), 4);
-        assert_eq!(&output, &[1, 2, 3, 4]);
-
-        // intermix consuming the errors with non-failures.
-        assert!(errs_eq(fs.new_dirbuilder().create("a/d").unwrap_err(), ENOENT())); // error 1
-        assert!(fs.new_dirbuilder().create("a/d").is_ok());
-        assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-        assert_eq!(rf.read(&mut output).unwrap(), 4); // ok 2
-        assert_eq!(&output, &[1, 2, 3, 4]);
-        assert_eq!(rf.seek(SeekFrom::Start(2)).unwrap(), 2);
-        assert!(errs_eq(rf.read(&mut output).unwrap_err(), EACCES())); // error 3
-        // and now we are back to normal
-        assert_eq!(rf.read(&mut output).unwrap(), 4);
-        assert_eq!(&output, &[2, 3, 4, 5]);
-    }
-}
+// #[cfg(test)]
+// mod test {
+// use super::*;
+// use errors::*;
+// use fs::{DirBuilder, GenFS, OpenOptions};
+// use std::io::{Error, Read, Seek, SeekFrom, Write};
+// use unix_ext::*;
+//
+// fn errs_eq(l: Error, r: Error) -> bool {
+// l.raw_os_error() == r.raw_os_error()
+// }
+//
+// #[test]
+// fn basic() {
+// let fs = FS::with_mode(0o300);
+// assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
+//
+// Push a few errors (rustfmt makes this hideous)...
+// fs.push_sequence(vec![// Fail creating a directory...
+// Box::new(|k: In| -> Option<Result<()>> {
+// match k {
+// In::DirBuilder(AtDirBuilder::Create) => {
+// Some(Err(ENOENT()))
+// }
+// _ => None,
+// }
+// }),
+// After which, one read must succeed.
+// Box::new(|k: In| -> Option<Result<()>> {
+// match k {
+// In::File(AtFile::Read) => Some(Ok(())),
+// _ => None,
+// }
+// }),
+// Then fail the next read.
+// Box::new(|k: In| -> Option<Result<()>> {
+// match k {
+// In::File(AtFile::Read) => Some(Err(EACCES())),
+// _ => None,
+// }
+// })]);
+//
+// open a file, write some content...
+// let mut wf =
+// fs.new_openopts().mode(0o600).write(true).create_new(true).open("a/f").unwrap();
+// assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
+//
+// open the file for reading, read some content...
+// let mut rf = fs.new_openopts().read(true).open("a/f").unwrap();
+// assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
+//
+// let mut output = [0u8; 4];
+// assert_eq!(rf.read(&mut output).unwrap(), 4);
+// assert_eq!(&output, &[1, 2, 3, 4]);
+//
+// intermix consuming the errors with non-failures.
+// assert!(errs_eq(fs.new_dirbuilder().create("a/d").unwrap_err(), ENOENT())); // error 1
+// assert!(fs.new_dirbuilder().create("a/d").is_ok());
+// assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
+// assert_eq!(rf.read(&mut output).unwrap(), 4); // ok 2
+// assert_eq!(&output, &[1, 2, 3, 4]);
+// assert_eq!(rf.seek(SeekFrom::Start(2)).unwrap(), 2);
+// assert!(errs_eq(rf.read(&mut output).unwrap_err(), EACCES())); // error 3
+// and now we are back to normal
+// assert_eq!(rf.read(&mut output).unwrap(), 4);
+// assert_eq!(&output, &[2, 3, 4, 5]);
+// }
+// }
+//
