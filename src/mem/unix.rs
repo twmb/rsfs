@@ -57,6 +57,8 @@
 
 extern crate parking_lot;
 
+use self::parking_lot::{Mutex, RwLock};
+
 use std::cmp::{self, Ordering};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -66,12 +68,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::vec::IntoIter;
 
-use self::parking_lot::{Mutex, RwLock};
+use fs::{self, FileType as _FileType, Metadata as _Metadata};
+use unix_ext::{self, PermissionsExt as _PermissionsExt};
 
 use errors::*;
-use fs::{self, FileType as FTG, Metadata as MG};
 use path_parts::{self, IteratorExt, Part};
-use unix_ext::{self, PermissionsExt as PEG};
 
 // TODO File could be tested more, maybe, but the raw_file seems sufficient.
 // Permissions and FileType can be tested directly - right now they are tested indirectly.
@@ -80,6 +81,7 @@ use unix_ext::{self, PermissionsExt as PEG};
 // the initial file size that Unix uses for a directory sector. This module does not attempt to
 // return a larger number if the directory contains many children with long names.
 const DIRLEN: u64 = 4096;
+const SYMLEN: u64 = 1;
 
 /// A builder used to create directories in various manners.
 ///
@@ -88,15 +90,15 @@ const DIRLEN: u64 = 4096;
 /// [documentation]: index.html
 #[derive(Debug)]
 pub struct DirBuilder {
-    recursive: bool,
-    mode: u32,
     fs: FS,
+
+    recursive: bool,
+    mode:      u32,
 }
 
 impl fs::DirBuilder for DirBuilder {
     fn recursive(&mut self, recursive: bool) -> &mut Self {
-        self.recursive = recursive;
-        self
+        self.recursive = recursive; self
     }
     fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         if self.recursive {
@@ -109,8 +111,7 @@ impl fs::DirBuilder for DirBuilder {
 
 impl unix_ext::DirBuilderExt for DirBuilder {
     fn mode(&mut self, mode: u32) -> &mut Self {
-        self.mode = mode;
-        self
+        self.mode = mode; self
     }
 }
 
@@ -122,7 +123,7 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 /// [documentation]: index.html
 #[derive(Debug, PartialEq)]
 pub struct DirEntry {
-    dir: PathBuf,
+    dir:  PathBuf,
     base: OsString,
     meta: Metadata,
 }
@@ -151,58 +152,39 @@ impl fs::DirEntry for DirEntry {
 #[derive(Debug)]
 struct RawFile {
     valid: bool,
-    data: Vec<u8>,
-}
-
-// append_at overwrites and appends bytes at a given existing index in a Vec.
-fn append_at<T: Copy>(dst: &mut Vec<T>, at: usize, src: &[T]) {
-    let end = src.len() + at;
-    if dst.len() > end {
-        dst[at..end].copy_from_slice(src);
-    } else {
-        dst.truncate(at);
-        dst.extend_from_slice(src);
-    }
+    data:  Vec<u8>,
 }
 
 impl RawFile {
-    // read_at reads contents of the file into buf from a given existing index in the file.
-    fn read_at(&self, at: usize, buf: &mut [u8]) -> Result<usize> {
+    // read_at reads contents of the file into dst from a given existing index in the file.
+    fn read_at(&self, at: usize, dst: &mut [u8]) -> Result<usize> {
         if !self.valid {
             return Err(ENOENT());
         }
 
-        let src;
-        let dst;
+        let unread = &self.data[at..];
+        let copy_size = cmp::min(dst.len(), unread.len());
 
-        let data = &self.data[at..];
-        let buf_len = buf.len();
-
-        match data.len().cmp(&buf_len) {
-            Ordering::Less => {
-                dst = &mut buf[..data.len()];
-                src = data;
-            }
-            Ordering::Greater => {
-                dst = buf;
-                src = &data[..buf_len];
-            }
-            Ordering::Equal => {
-                dst = buf;
-                src = data;
-            }
-        }
-        dst.copy_from_slice(src);
-        Ok(dst.len())
+        dst[..copy_size].copy_from_slice(&unread[..copy_size]);
+        Ok(copy_size)
     }
 
     // write_at writes to the RawFile at a given index, which must be at or less than `data.len()`.
-    fn write_at(&mut self, at: usize, buf: &[u8]) -> Result<usize> {
+    fn write_at(&mut self, at: usize, src: &[u8]) -> Result<usize> {
         if !self.valid {
             return Err(ENOENT());
         }
-        append_at(&mut self.data, at, buf);
-        Ok(buf.len())
+
+        let mut dst = &mut self.data;
+        let new_end = src.len() + at;
+
+        if dst.len() > new_end {
+            dst[at..new_end].copy_from_slice(src);
+        } else {
+            dst.truncate(at);
+            dst.extend_from_slice(src);
+        }
+        Ok(src.len())
     }
 
     // invalidate ensures that all future operations on files will fail with ENOENT.
@@ -222,12 +204,14 @@ impl RawFile {
 /// [documentation]: index.html
 #[derive(Debug)]
 pub struct File {
-    read: bool,
-    write: bool,
+    read:   bool,
+    write:  bool,
     append: bool,
+
     metadata: Metadata,
+
     file: Arc<RwLock<RawFile>>,
-    at: usize,
+    at:   usize,
 }
 
 impl fs::File for File {
@@ -243,11 +227,9 @@ impl Read for File {
         if !self.read {
             return Err(EBADF());
         }
-        let res = self.file.read().read_at(self.at, buf);
-        if let Ok(size) = res {
-            self.at += size;
-        }
-        res
+        let n_read = self.file.read().read_at(self.at, buf)?;
+        self.at += n_read;
+        Ok(n_read)
     }
 }
 
@@ -260,11 +242,9 @@ impl Write for File {
         if self.append {
             self.at = file.data.len();
         }
-        let res = file.write_at(self.at, buf);
-        if let Ok(size) = res {
-            self.at += size;
-        }
-        res
+        let n_wrote = file.write_at(self.at, buf)?;
+        self.at += n_wrote;
+        Ok(n_wrote)
     }
     fn flush(&mut self) -> Result<()> {
         if !self.write {
@@ -276,30 +256,57 @@ impl Write for File {
 
 impl Seek for File {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        let file = self.file.write();
+        let len = file.data.len();
+        // seek seemingly returns (if successful) the sum of the position we are seeking from and
+        // the offset. This is the case even if we seek past the end of the file.
         match pos {
             SeekFrom::Start(offset) => {
-                self.at = cmp::min(self.file.write().data.len(), offset as usize);
+                self.at = cmp::min(len, offset as usize);
                 Ok(offset)
             }
-            _ => Err(Error::new(ErrorKind::Other, "only SeekFrom is implemented")),
+            SeekFrom::Current(offset) => {
+                let at_end = (self.at as i64).saturating_add(offset);
+                if at_end < 0 {
+                    return Err(EINVAL());
+                }
+                self.at = cmp::min(len, at_end as usize);
+                Ok(at_end as u64)
+            }
+            SeekFrom::End(offset) => {
+                let at_end = (len as i64).saturating_add(offset);
+                if at_end < 0 {
+                    return Err(EINVAL());
+                }
+                self.at = cmp::min(len, at_end as usize);
+                Ok(at_end as u64)
+            }
         }
     }
 }
 
+// Ftyp is the actual underlying enum for a FileType.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Ftyp {
+    File,
+    Dir,
+    Symlink,
+}
+
 /// Represents the type of a file.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct FileType {
-    // TODO this is quite possibly the laziest implementation possible. It could be cleaner.
-    dir: bool,
-}
+pub struct FileType(Ftyp);
 
 impl fs::FileType for FileType {
     fn is_dir(&self) -> bool {
-        self.dir
+        self.0 == Ftyp::Dir
     }
     fn is_file(&self) -> bool {
-        !self.dir
+        self.0 == Ftyp::File
     }
+    //fn is_symlink(&self) -> bool {
+    //    self.0 == Ftyp::Symlink
+    //}
 }
 
 /// Metadata information about a file.
@@ -310,13 +317,13 @@ impl fs::FileType for FileType {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Metadata {
     filetype: FileType,
-    length: u64,
-    perms: Permissions,
+    length:   u64,
+    perms:    Permissions,
 }
 
 impl fs::Metadata for Metadata {
     type Permissions = Permissions;
-    type FileType = FileType;
+    type FileType    = FileType;
 
     fn file_type(&self) -> Self::FileType {
         self.filetype
@@ -342,42 +349,36 @@ impl fs::Metadata for Metadata {
 /// [documentation]: index.html
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
-    read: bool,
-    write: bool,
+    fs:     FS,
+    read:   bool,
+    write:  bool,
     append: bool,
-    trunc: bool,
+    trunc:  bool,
     create: bool,
-    excl: bool,
-    mode: u32,
-    fs: FS,
+    excl:   bool,
+    mode:   u32,
 }
 
 impl fs::OpenOptions for OpenOptions {
     type File = File;
 
     fn read(&mut self, read: bool) -> &mut Self {
-        self.read = read;
-        self
+        self.read = read; self
     }
     fn write(&mut self, write: bool) -> &mut Self {
-        self.write = write;
-        self
+        self.write = write; self
     }
     fn append(&mut self, append: bool) -> &mut Self {
-        self.append = append;
-        self
+        self.append = append; self
     }
     fn truncate(&mut self, truncate: bool) -> &mut Self {
-        self.trunc = truncate;
-        self
+        self.trunc = truncate; self
     }
     fn create(&mut self, create: bool) -> &mut Self {
-        self.create = create;
-        self
+        self.create = create; self
     }
     fn create_new(&mut self, create_new: bool) -> &mut Self {
-        self.excl = create_new;
-        self
+        self.excl = create_new; self
     }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
         self.fs.inner.lock().open(path, self)
@@ -386,8 +387,7 @@ impl fs::OpenOptions for OpenOptions {
 
 impl unix_ext::OpenOptionsExt for OpenOptions {
     fn mode(&mut self, mode: u32) -> &mut Self {
-        self.mode = mode;
-        self
+        self.mode = mode; self
     }
 }
 
@@ -406,38 +406,45 @@ pub struct ReadDir {
 }
 
 impl ReadDir {
-    // read_dir on every system I have ever used returns dirents in alphabetical order, so we will
-    // recreate that behavior here.
     fn new<P: AsRef<Path>>(path: P, dir: &Dirent) -> Result<ReadDir> {
-        // read_dir is about the only call that needs read permissions (and remove_dir_all below,
-        // but only because that does not use read_dir).
         if !dir.readable() {
             return Err(EACCES());
         }
-        let children = dir.children.as_ref().ok_or_else(ENOTDIR)?;
+        let children = {
+            match dir.kind {
+                DeKind::Dir(ref children) => children,
+                _ => return Err(ENOTDIR()),
+            }
+        };
+
+        // iterate over the children and create a bunch of DirEntrys as appropriate.
         let mut dirents = Vec::new();
         for (base, dirent) in children.iter() {
             let dirent = dirent.read();
             dirents.push(DirEntry {
-                dir: PathBuf::from(path.as_ref()),
+                dir:  PathBuf::from(path.as_ref()),
                 base: base.clone(),
-                meta: || -> Metadata {
-                    if dirent.is_dir() {
-                        Metadata {
-                            filetype: FileType { dir: true },
-                            length: DIRLEN,
-                            perms: Permissions::from_mode(dirent.mode),
-                        }
-                    } else {
-                        Metadata {
-                            filetype: FileType { dir: false },
-                            length: dirent.file.as_ref().unwrap().read().data.len() as u64,
-                            perms: Permissions::from_mode(dirent.mode),
-                        }
-                    }
-                }(),
+                meta: match dirent.kind {
+                    DeKind::Dir(_) => Metadata {
+                        filetype: FileType(Ftyp::Dir),
+                        length:   DIRLEN,
+                        perms:    Permissions::from_mode(dirent.mode),
+                    },
+                    DeKind::File(ref f) => Metadata {
+                        filetype: FileType(Ftyp::File),
+                        length:   f.read().data.len() as u64,
+                        perms:    Permissions::from_mode(dirent.mode),
+                    },
+                    DeKind::Symlink(_) => Metadata {
+                        filetype: FileType(Ftyp::Symlink),
+                        length:   SYMLEN,
+                        perms:    Permissions::from_mode(dirent.mode),
+                    },
+                },
             });
         }
+        // read_dir on every system I have ever used returns dirents in alphabetical order, so we
+        // will recreate that behavior here.
         dirents.sort_by(|l, r| match l.dir.cmp(&r.dir) {
             Ordering::Equal => l.base.cmp(&r.base),
             x => x,
@@ -511,15 +518,14 @@ impl FS {
     /// Creates an empty `FS` with the given mode.
     pub fn with_mode(mode: u32) -> FS {
         let pwd = Arc::new(RwLock::new(Dirent {
-            mode: mode,
-            file: None,
             parent: Weak::new(),
-            children: Some(HashMap::new()),
+            kind:   DeKind::Dir(HashMap::new()),
+            mode:   mode,
         }));
         FS {
             inner: Arc::new(Mutex::new(FileSystem {
                 root: pwd.clone(),
-                pwd: pwd,
+                pwd:  pwd,
             })),
         }
     }
@@ -569,12 +575,12 @@ impl PartialEq for FS {
 }
 
 impl fs::GenFS for FS {
-    type DirBuilder = DirBuilder;
-    type DirEntry = DirEntry;
-    type Metadata = Metadata;
+    type DirBuilder  = DirBuilder;
+    type DirEntry    = DirEntry;
+    type Metadata    = Metadata;
     type OpenOptions = OpenOptions;
     type Permissions = Permissions;
-    type ReadDir = ReadDir;
+    type ReadDir     = ReadDir;
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         self.inner.lock().metadata(path)
@@ -600,43 +606,69 @@ impl fs::GenFS for FS {
 
     fn new_openopts(&self) -> OpenOptions {
         OpenOptions {
-            read: false,
-            write: false,
+            fs:     self.clone(),
+            read:   false,
+            write:  false,
             append: false,
-            trunc: false,
+            trunc:  false,
             create: false,
-            excl: false,
-            mode: 0o666, // default per unix_ext
-            fs: self.clone(),
+            excl:   false,
+            mode:   0o666, // default per unix_ext
         }
     }
     fn new_dirbuilder(&self) -> DirBuilder {
         DirBuilder {
-            recursive: false,
-            mode: 0o777, // default per unix_ext
             fs: self.clone(),
+
+            recursive: false,
+            mode:      0o777, // default per unix_ext
         }
     }
 }
 
-// Dirent, which would be Dirent if DirEntry were not already taken, represents all information
-// needed at a node in our filesystem tree.
-//
-// A Dirent is either a file OR a children, not both and not neither, but it seemed more
-// uglier than it was worth to combine both of those into an enum.
+// DeKind differentiates between files, directories, and symlinks.
+#[derive(Debug)]
+enum DeKind {
+    File(Arc<RwLock<RawFile>>),
+    Dir(HashMap<OsString, Arc<RwLock<Dirent>>>),
+    Symlink(PathBuf),
+}
+
+impl DeKind {
+    fn file_ref(&self) -> &Arc<RwLock<RawFile>> {
+        match *self {
+            DeKind::File(ref f) => f,
+            _ => panic!("file_ref used on DeKind when not a file"),
+        }
+    }
+    fn dir_ref(&self) -> &HashMap<OsString, Arc<RwLock<Dirent>>> {
+        match *self {
+            DeKind::Dir(ref d) => d,
+            _ => panic!("dir_ref used on DeKind when not a dir"),
+        }
+    }
+    fn dir_mut(&mut self) -> &mut HashMap<OsString, Arc<RwLock<Dirent>>> {
+        match *self {
+            DeKind::Dir(ref mut d) => d,
+            _ => panic!("dir_mut used on DeKind when not a dir"),
+        }
+    }
+}
+
+// Dirent represents all information needed at a node in our filesystem tree.
 #[derive(Debug)]
 struct Dirent {
-    mode: u32,
-
-    file: Option<Arc<RwLock<RawFile>>>,
-
     parent: Weak<RwLock<Dirent>>,
-    children: Option<HashMap<OsString, Arc<RwLock<Dirent>>>>,
+    kind:   DeKind,
+    mode:   u32,
 }
 
 impl Dirent {
     fn is_dir(&self) -> bool {
-        self.file.is_none()
+        match self.kind {
+            DeKind::Dir(_) => true,
+            _ => false,
+        }
     }
     fn readable(&self) -> bool {
         self.mode & 0o400 > 0
@@ -649,50 +681,45 @@ impl Dirent {
     }
 }
 
-// FileSystem is a single in-memory filesystem that can be used cloned and passed around safely.
+// FileSystem is a single in-memory filesystem that can be cloned and passed around safely.
 #[derive(Debug)]
 struct FileSystem {
     root: Arc<RwLock<Dirent>>,
-    pwd: Arc<RwLock<Dirent>>,
+    pwd:  Arc<RwLock<Dirent>>,
 }
 
 fn path_empty<P: AsRef<Path>>(path: P) -> bool {
     path.as_ref() == Path::new("")
 }
 
-// We claim that two filesystems are equal if they have they have the same structure and mode. This
-// currently does not validate file contents.
+// We claim that two filesystems are equal if they have the same structure, contents, and modes.
 impl PartialEq for FileSystem {
     fn eq(&self, other: &FileSystem) -> bool {
         fn eq_at(l: Arc<RwLock<Dirent>>, r: Arc<RwLock<Dirent>>) -> bool {
-            let bl = l.read();
-            let br = r.read();
-            if bl.mode != br.mode {
+            let l = l.read();
+            let r = r.read();
+            if l.mode != r.mode {
                 return false;
             }
-            match (bl.file.is_some(), br.file.is_some()) {
-                (true, true) => return true,
-                (false, false) => (),
-                _ => return false,
-            }
-
-            // Both must be directories here.
-            let ch_l = bl.children.as_ref().unwrap();
-            let ch_r = br.children.as_ref().unwrap();
-            if ch_l.len() != ch_r.len() {
-                return false;
-            }
-            for (child_name, cl) in ch_l.iter() {
-                match ch_r.get(child_name) {
-                    Some(cr) => {
-                        if !eq_at(cl.clone(), cr.clone()) {
-                            return false;
+            match (&l.kind, &r.kind) {
+                (&DeKind::File(ref fl), &DeKind::File(ref fr)) => fl.read().data == fr.read().data,
+                (&DeKind::Dir(ref dl), &DeKind::Dir(ref dr)) => {
+                    if dl.len() != dr.len() {
+                        return false;
+                    }
+                    for (child_name, cl) in dl.iter() {
+                        match dr.get(child_name) {
+                            Some(cr) => if !eq_at(cl.clone(), cr.clone()) {
+                                return false;
+                            },
+                            None => return false,
                         }
                     }
-                    None => return false,
-                }
+					true
+                },
+                (&DeKind::Symlink(ref sl), &DeKind::Symlink(ref sr)) => sl == sr,
+                _ => false,
             }
-            true
         }
 
         eq_at(self.root.clone(), other.root.clone())
@@ -701,24 +728,20 @@ impl PartialEq for FileSystem {
 
 impl FileSystem {
     // up_path traverses up parent directories in a normalized path, erroring if we cannot cd into
-    // (exec) the parent directory.
+    // (exec) the parent directory. This function expects no symlinks from pwd to root.
     fn up_path(&self,
                parts: path_parts::Parts)
                -> Result<(Arc<RwLock<Dirent>>, path_parts::Parts)> {
-        // If the parts begin at root, they will have no ParentDirs. We go up and return at root.
+        // If (normalized) parts begins at root, there are no ParentDirs.
         if parts.at_root() {
             return Ok((self.root.clone(), parts));
         }
 
-        // `up` is what we return: the Arc<Dirent> after traversing up all ParentDirs in `parts`.
+        // `up` is what we return: the dirent after traversing up all ParentDirs in `parts`.
         let mut up = self.pwd.clone();
         let mut parts_iter = parts.into_iter().peekable();
         while parts_iter.peek()
-                        .and_then(|part| if *part == Part::ParentDir {
-                            Some(())
-                        } else {
-                            None
-                        })
+                        .and_then(|part| if *part == Part::ParentDir { Some(()) } else { None })
                         .is_some() {
             parts_iter.next();
             if let Some(parent) = {
@@ -754,22 +777,32 @@ impl FileSystem {
 
             fs = {
                 let fs = fs.read();
-                let children = fs.children.as_ref().ok_or_else(ENOTDIR)?;
-                children.get(parts_iter.next().unwrap().as_normal().unwrap())
-                        .cloned()
-                        .ok_or_else(ENOENT)?
+                match fs.kind {
+                    DeKind::Dir(ref children) => children.get(parts_iter.next()
+                                                                        .expect("peek2 is Some, next is None")
+                                                                        .as_normal()
+                                                                        .expect("parts_iter should be Normal after up_path"))
+                                                         .cloned()
+                                                         .ok_or_else(ENOENT)?,
+                    DeKind::Symlink(ref path) => unimplemented!(),
+                    _ => return Err(ENOTDIR()),
+                }
             };
         }
         if !fs.read().is_dir() {
             return Err(ENOTDIR());
         }
 
+        // TODO if this is a symlink, traverse it!
         match parts_iter.next() {
             Some(Part::Normal(base)) => Ok((fs, Some(base))),
             _ => Ok((fs, None)),
         }
     }
 
+    // cd changes the filesystems current working directory (cwd). TODO: we need to remember if we
+    // are in a symlink. This may be "easy" by simply keeping the normalized path that we are at
+    // and always appending to that at all times, cleaning up every time.
     fn cd<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let base = match may_base {
@@ -783,8 +816,8 @@ impl FileSystem {
                 }
             }
         };
-        let borrow = fs.read();
-        match borrow.children.as_ref().unwrap().get(&base) {
+        let fs = fs.read();
+        match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 self.pwd = child.clone();
                 Ok(())
@@ -806,8 +839,8 @@ impl FileSystem {
                 }
             }
         };
-        let borrow = fs.write();
-        match borrow.children.as_ref().unwrap().get(&base) {
+        let fs = fs.write();
+        match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 child.write().mode = mode;
                 Ok(())
@@ -816,6 +849,8 @@ impl FileSystem {
         }
     }
 
+    // create_dir is the base used for both mkdir and create_dir_all. create_dir_all does not fail
+    // if the directory already exists.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let base = match may_base {
@@ -832,12 +867,15 @@ impl FileSystem {
             }
         };
 
-        if !fs.read().executable() || !fs.read().writable() {
-            return Err(EACCES());
+        {
+            let fs = fs.read();
+            if !fs.executable() || !fs.writable() {
+                return Err(EACCES());
+            }
         }
 
         let mut borrow = fs.write();
-        match borrow.children.as_mut().unwrap().entry(base) {
+        match borrow.kind.dir_mut().entry(base) {
             Entry::Occupied(o) => {
                 if can_exist && o.get().read().is_dir() {
                     return Ok(());
@@ -846,10 +884,9 @@ impl FileSystem {
             }
             Entry::Vacant(v) => {
                 v.insert(Arc::new(RwLock::new(Dirent {
-                    mode: mode,
-                    file: None,
                     parent: Arc::downgrade(&fs),
-                    children: Some(HashMap::new()),
+                    kind:   DeKind::Dir(HashMap::new()),
+                    mode:   mode,
                 })));
                 Ok(())
             }
@@ -864,7 +901,7 @@ impl FileSystem {
         let (_, parts) = self.up_path(path_parts::normalize(&path))?;
         let mut path_buf = PathBuf::new();
         for part in parts {
-            path_buf.push(part.into_normal().unwrap());
+            path_buf.push(part.into_normal().expect("parts_iter after up_path should only be Normal"));
             self.create_dir(&path_buf, mode, true)?;
         }
         Ok(())
@@ -884,7 +921,7 @@ impl FileSystem {
                     return Err(ENOENT());
                 } else {
                     return Ok(Metadata {
-                        filetype: FileType { dir: true },
+                        filetype: FileType(Ftyp::Dir),
                         perms: Permissions::from_mode(fs.mode),
                         length: DIRLEN,
                     });
@@ -896,24 +933,26 @@ impl FileSystem {
             return Err(EACCES());
         }
 
-        match fs.children.as_ref().unwrap().get(&base) {
+        match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 let child = child.read();
-                Ok(|| -> Metadata {
-                    if child.is_dir() {
-                        Metadata {
-                            filetype: FileType { dir: true },
-                            perms: Permissions::from_mode(child.mode),
-                            length: DIRLEN,
-                        }
-                    } else {
-                        Metadata {
-                            filetype: FileType { dir: false },
-                            perms: Permissions::from_mode(child.mode),
-                            length: child.file.as_ref().unwrap().read().data.len() as u64,
-                        }
-                    }
-                }())
+                Ok(match child.kind {
+                    DeKind::Dir(_) => Metadata {
+                        filetype: FileType(Ftyp::Dir),
+                        length:   DIRLEN,
+                        perms:    Permissions::from_mode(child.mode),
+                    },
+                    DeKind::File(ref f) => Metadata {
+                        filetype: FileType(Ftyp::File),
+                        length:   f.read().data.len() as u64,
+                        perms:    Permissions::from_mode(child.mode),
+                    },
+                    DeKind::Symlink(_) => Metadata {
+                        filetype: FileType(Ftyp::Symlink),
+                        length:   SYMLEN,
+                        perms:    Permissions::from_mode(child.mode),
+                    },
+                })
             }
             None => Err(ENOENT()),
         }
@@ -934,7 +973,7 @@ impl FileSystem {
             }
         };
 
-        match fs.children.as_ref().unwrap().get(&base) {
+        match fs.kind.dir_ref().get(&base) {
             Some(child) => ReadDir::new(&path, &*child.read()),
             None => Err(ENOENT()),
         }
@@ -943,113 +982,115 @@ impl FileSystem {
     fn remove<P: AsRef<Path>>(&self, path: P, kind: FileType) -> Result<()> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let base = may_base.ok_or_else(|| if path_empty(&path) {
-                               ENOENT()
-                           } else {
-                               EACCES()
-                           })?;
+                                              ENOENT()
+                                          } else {
+                                              EACCES()
+                                          })?;
 
-        if !fs.read().executable() || !fs.read().writable() {
-            return Err(EACCES());
+        {
+            let fs = fs.read();
+            if !fs.executable() || !fs.writable() {
+                return Err(EACCES());
+            }
         }
 
         // We need to make sure that the FileType being requested for removal matches the FileType
         // of the directory. Scope this check to let the non mutable borrow drop before removing.
         {
             let child = fs.read();
-            let child = child.children.as_ref().unwrap().get(&base).ok_or_else(ENOENT)?;
+            let child = child
+                          .kind
+                          .dir_ref()
+                          .get(&base)
+                          .ok_or_else(ENOENT)?
+                          .read();
 
-            if kind.is_file() {
-                if child.read().is_dir() {
-                    return Err(EISDIR());
-                }
-            } else {
-                if !child.read().is_dir() {
-                    return Err(ENOTDIR());
-                }
-                if !child.read().children.as_ref().unwrap().is_empty() {
-                    return Err(ENOTEMPTY());
-                }
+            match kind.0 {
+                // TODO is this correct for Symlink?
+                Ftyp::File | Ftyp::Symlink => if child.is_dir() { return Err(EISDIR()); },
+                Ftyp::Dir => {
+                    if !child.is_dir() {
+                        return Err(ENOTDIR());
+                    }
+                    if !child.kind.dir_ref().is_empty() {
+                        return Err(ENOTEMPTY());
+                    }
+                },
             }
         }
 
-        fs.write().children.as_mut().unwrap().remove(&base);
+        fs.write().kind.dir_mut().remove(&base);
         Ok(())
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.remove(path, FileType { dir: false })
+        self.remove(path, FileType(Ftyp::File))
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.remove(path, FileType { dir: true })
+        self.remove(path, FileType(Ftyp::Dir))
     }
 
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        // Rust's remove_dir_all is actually very weak (weaker than rm -r). Rust relies on
-        // read_dir to recurse, which requires `ls`. Standard linux is able to remove empty
-        // directories with only write and execute privileges. This code attempts to mimic what
-        // Rust will do.
+        // Rust's remove_dir_all is actually very weak (weaker than rm -r). Rust relies on read_dir
+        // to recurse, which requires `ls`. Standard linux is able to remove empty directories with
+        // only write and execute privileges. This code attempts to mimic what Rust will do.
         fn recursive_remove(fs: Arc<RwLock<Dirent>>) -> Result<()> {
-            if fs.read().children.is_some() {
-                let mut borrow = fs.write();
-                if !borrow.readable() || !borrow.executable() || !borrow.writable() {
-                    return Err(EACCES());
-                }
-
-                let mut children = borrow.children.as_mut().unwrap();
-                let mut deleted = Vec::new();
-                let res: Result<()> = {
-                    let mut child_names = Vec::new();
-                    for child in children.iter() {
-                        child_names.push(child);
+            let mut fs = fs.write();
+            let accessible = fs.readable() && fs.executable() && fs.writable();
+            match fs.kind {
+                DeKind::Dir(ref mut children) => {
+                    if !accessible {
+                        return Err(EACCES());
                     }
-                    child_names.sort_by_key(|&(k, _)| k);
 
-                    for &(child_name, child) in &child_names {
-                        match recursive_remove(child.clone()) {
-                            Ok(_) => {
-                                deleted.push(child_name.clone());
-                            }
-                            Err(e) => {
-                                return Err(e);
+                    let mut deleted = Vec::new();
+                    let res: Result<()> = {
+                        let mut child_names = Vec::new();
+                        for child in children.iter() {
+                            child_names.push(child);
+                        }
+                        // recursive removes work alphabetically
+                        child_names.sort_by_key(|&(k, _)| k);
+
+                        for &(child_name, child) in &child_names {
+                            match recursive_remove(child.clone()) {
+                                Ok(_) => deleted.push(child_name.clone()),
+                                Err(e) => return Err(e),
                             }
                         }
+                        Ok(())
+                    };
+                    for child_name in deleted {
+                        children.remove(&child_name);
                     }
-                    Ok(())
-                };
-                for child_name in deleted {
-                    children.remove(&child_name);
+                    res?
                 }
-                res?
-            } else {
-                fs.write().file.as_mut().map(|f| f.write().invalidate());
+                DeKind::File(ref mut f) => f.write().invalidate(),
+                DeKind::Symlink(_) => unimplemented!(), // TODO: this should just be a no-op?
+                                                        //       symlinks aren't followed in
+                                                        //       recursive removes
             }
             Ok(())
         }
 
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
-        let child = match may_base {
-            Some(ref base) => {
-                let fs = fs.read();
+        match may_base {
+            Some(base) => { // removing a non-root path
+                let mut fs = fs.write();
                 if !fs.executable() || !fs.writable() {
                     return Err(EACCES());
                 }
-                match fs.children.as_ref().unwrap().get(base) {
-                    Some(child) => child.clone(),
-                    None => return Ok(()),
+                let children = fs.kind.dir_mut();
+                if let Entry::Occupied(child) = children.entry(base) {
+                    recursive_remove(child.get().clone())?;
+                    child.remove();
                 }
             }
-            None => {
+            None => { // removing everything under root
                 if path_empty(&path) {
                     return Err(ENOENT());
-                } else {
-                    fs.clone()
                 }
+                recursive_remove(fs.clone())?;
             }
-        };
-
-        recursive_remove(child)?;
-
-        if let Some(ref base) = may_base {
-            fs.write().children.as_mut().unwrap().remove(base);
         }
         Ok(())
     }
@@ -1057,10 +1098,11 @@ impl FileSystem {
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
         let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from))?;
         let old_base = old_may_base.ok_or_else(|| if path_empty(&from) {
-                                       ENOENT()
-                                   } else {
-                                       Error::new(ErrorKind::Other, "rename of root unimplemented")
-                                   })?;
+                                                      ENOENT()
+                                                  } else {
+                                                      Error::new(ErrorKind::Other,
+                                                                 "rename of root unimplemented")
+                                                  })?;
         let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to))?;
         let new_base =
             new_may_base.ok_or_else(|| if path_empty(&to) { ENOENT() } else { EEXIST() })?;
@@ -1069,35 +1111,39 @@ impl FileSystem {
             return Ok(());
         }
 
-        if !old_fs.read().executable() || !old_fs.read().writable() {
-            return Err(EACCES());
-        }
-        if !new_fs.read().executable() || !new_fs.read().writable() {
-            return Err(EACCES());
+        {
+            let old_fs = old_fs.read();
+            if !old_fs.executable() || !old_fs.writable() {
+                return Err(EACCES());
+            }
+            let new_fs = new_fs.read();
+            if !new_fs.executable() || !new_fs.writable() {
+                return Err(EACCES());
+            }
         }
 
         // Rust's rename is strong, but also annoying, in that it can rename a directory to a
         // directory if that directory is empty. We could make the code elegant, but this will do.
         let (old_exist, old_is_dir) =
-            match old_fs.read().children.as_ref().unwrap().get(&old_base) {
+            match old_fs.read().kind.dir_ref().get(&old_base) {
                 Some(child) => (true, child.read().is_dir()),
                 None => (false, false),
-            };
-
-        let (new_exist, new_is_dir, new_is_empty) =
-            match new_fs.read().children.as_ref().unwrap().get(&new_base) {
-                Some(child) => {
-                    match child.read().children {
-                        Some(ref children) => (true, true, children.is_empty()),
-                        None => (true, false, false),
-                    }
-                }
-                None => (false, false, false),
             };
 
         if !old_exist {
             return Err(ENOENT());
         }
+
+        let (new_exist, new_is_dir, new_is_empty) =
+            match new_fs.read().kind.dir_ref().get(&new_base) {
+                Some(child) => {
+                    match child.read().kind {
+                        DeKind::Dir(ref children) => (true, true, children.is_empty()),
+                        _ => (true, false, false),
+                    }
+                }
+                None => (false, false, false),
+            };
 
         if !old_is_dir {
             if new_is_dir {
@@ -1113,8 +1159,9 @@ impl FileSystem {
             }
         }
 
-        let removed = old_fs.write().children.as_mut().unwrap().remove(&old_base).unwrap();
-        new_fs.write().children.as_mut().unwrap().insert(new_base, removed);
+        let removed = old_fs.write().kind.dir_mut().remove(&old_base)
+                                              .expect("logic verifying dirent existence is wrong");
+        new_fs.write().kind.dir_mut().insert(new_base, removed);
         Ok(())
     }
 
@@ -1139,7 +1186,7 @@ impl FileSystem {
             return Err(EINVAL());
         }
 
-        // Now we get on with opening.
+        // Now, on with (potentially) opening.
         let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
         let base = match may_base {
             Some(base) => base,
@@ -1154,7 +1201,9 @@ impl FileSystem {
         if !fs.read().executable() {
             return Err(EACCES());
         }
-        if let Some(child) = fs.read().children.as_ref().unwrap().get(&base) {
+
+        // If the file exists, open it.
+        if let Some(child) = fs.read().kind.dir_ref().get(&base) {
             return open_existing(child, &options);
         }
 
@@ -1165,28 +1214,29 @@ impl FileSystem {
         if !options.create {
             return Err(ENOENT());
         }
-        let file = Arc::new(RwLock::new(RawFile {
+        let file = Arc::new(RwLock::new(RawFile { // backing "inode" file
             valid: true,
-            data: Vec::new(),
+            data:  Vec::new(),
         }));
-        let child = Arc::new(RwLock::new(Dirent {
-            mode: options.mode,
-            file: Some(file.clone()),
+        let child = Arc::new(RwLock::new(Dirent { // hard link
             parent: Arc::downgrade(&fs),
-            children: None,
+            kind:   DeKind::File(file.clone()),
+            mode:   options.mode,
         }));
-        fs.write().children.as_mut().unwrap().insert(base, child);
-        Ok(File {
-            read: options.read,
-            write: options.write,
+        fs.write().kind.dir_mut().insert(base, child);
+        Ok(File { // file view
+            read:   options.read,
+            write:  options.write,
             append: options.append,
+
             metadata: Metadata {
-                filetype: FileType { dir: false },
-                length: 0,
-                perms: Permissions::from_mode(options.mode),
+                filetype: FileType(Ftyp::File),
+                length:   0,
+                perms:    Permissions::from_mode(options.mode),
             },
+
             file: file.clone(),
-            at: 0,
+            at:   0,
         })
     }
 }
@@ -1223,7 +1273,7 @@ fn open_existing(fs: &Arc<RwLock<Dirent>>, options: &OpenOptions) -> Result<File
         write = true;
     }
     let (file, len) = {
-        let arc_file = fs.file.as_ref().unwrap().clone();
+        let arc_file = fs.kind.file_ref().clone();
         let len = {
             let mut raw_file = arc_file.write();
             if options.trunc {
@@ -1238,7 +1288,7 @@ fn open_existing(fs: &Arc<RwLock<Dirent>>, options: &OpenOptions) -> Result<File
         write: write,
         append: options.append,
         metadata: Metadata {
-            filetype: FileType { dir: false },
+            filetype: FileType(Ftyp::File),
             length: len as u64,
             perms: Permissions::from_mode(options.mode),
         },
@@ -1266,88 +1316,94 @@ mod test {
 
     #[test]
     fn equal() {
+        // First, we prove our filesystem comparison operations work.
+        // TODO add a symlink here
         let exp_pwd = Arc::new(RwLock::new(Dirent {
-            mode: 0o0,
-            file: None,
             parent: Weak::new(),
-            children: Some(HashMap::new()),
+            kind:   DeKind::Dir(HashMap::new()),
+            mode:   0,
         }));
 
         let exp = FS {
             inner: Arc::new(Mutex::new(FileSystem {
                 root: exp_pwd.clone(),
-                pwd: exp_pwd,
+                pwd:  exp_pwd,
             })),
         };
         {
-            let ref mut root = exp.inner.lock().pwd;
-            root.write()
-                .children
-                .as_mut()
-                .unwrap()
-                .insert(OsString::from("lolz"),
+            let ref mut root_rc = exp.inner.lock().pwd;
+            let mut root = root_rc.write();
+            let ref mut dir = root.kind.dir_mut();
+            dir.insert(OsString::from("lolz"),
                         Arc::new(RwLock::new(Dirent {
-                            mode: 0o666,
-                            file: None,
-                            parent: Arc::downgrade(&root),
-                            children: Some(HashMap::new()),
+                            parent: Arc::downgrade(&root_rc),
+                            kind:   DeKind::Dir(HashMap::new()),
+                            mode:   0o666,
+                        })));
+            dir.insert(OsString::from("f"),
+                        Arc::new(RwLock::new(Dirent{
+                            parent: Arc::downgrade(&root_rc),
+                            kind:   DeKind::File(Arc::new(RwLock::new(RawFile{
+                                valid: false,
+                                data:  vec![1, 2, 3],
+                            }))),
+                            mode:   0o334,
                         })));
         }
 
         let fs = FS::with_mode(0o777);
         assert!(fs.new_dirbuilder().mode(0o666).create("lolz").is_ok());
+        let mut f = fs.new_openopts().mode(0o334).write(true).create_new(true).open("f").unwrap();
+        assert!(f.write(vec![1, 2, 3].as_slice()).is_ok());
         assert!(fs.set_permissions("/", Permissions::from_mode(0)).is_ok());
         assert!(fs == exp);
     }
 
     #[test]
     fn mkdir() {
+        // We just proved that file system comparisons work. Let's build a slightly more
+        // complicated filesystem and then prove mkdir works.
         let exp_pwd = Arc::new(RwLock::new(Dirent {
-            mode: 0o300,
-            file: None,
             parent: Weak::new(),
-            children: Some(HashMap::new()),
+            kind:   DeKind::Dir(HashMap::new()),
+            mode:   0o300,
         }));
         let exp = FS {
             inner: Arc::new(Mutex::new(FileSystem {
                 root: exp_pwd.clone(),
-                pwd: exp_pwd,
+                pwd:  exp_pwd,
             })),
         };
 
         {
             let ref mut root = exp.inner.lock().pwd;
             let mut borrow = root.write();
-            let children = borrow.children.as_mut().unwrap();
+            let children = borrow.kind.dir_mut();
             children.insert(OsString::from("a"),
                             Arc::new(RwLock::new(Dirent {
-                                mode: 0o500, // r-x: cannot create subfiles
-                                file: None,
                                 parent: Arc::downgrade(&root),
-                                children: Some(HashMap::new()),
+                                kind:   DeKind::Dir(HashMap::new()),
+                                mode:   0o500, // r-x: cannot create subfiles
                             })));
             children.insert(OsString::from("b"),
                             Arc::new(RwLock::new(Dirent {
-                                mode: 0o600, // rw-: cannot exec (cd) into to create subfiles
-                                file: None,
                                 parent: Arc::downgrade(&root),
-                                children: Some(HashMap::new()),
+                                kind:   DeKind::Dir(HashMap::new()),
+                                mode:   0o600, // rw-: cannot exec (cd) into to create subfiles
                             })));
             let child = Arc::new(RwLock::new(Dirent {
-                mode: 0o300, // _wx: all we need
-                file: None,
                 parent: Arc::downgrade(&root),
-                children: Some(HashMap::new()),
+                kind:   DeKind::Dir(HashMap::new()),
+                mode:   0o300, // _wx: all we need
             }));
             {
                 let mut child_borrow = child.write();
-                let child_children = child_borrow.children.as_mut().unwrap();
+                let child_children = child_borrow.kind.dir_mut();
                 child_children.insert(OsString::from("d"),
                                       Arc::new(RwLock::new(Dirent {
-                                          mode: 0o777,
-                                          file: None,
                                           parent: Arc::downgrade(&child),
-                                          children: Some(HashMap::new()),
+                                          kind:   DeKind::Dir(HashMap::new()),
+                                          mode:   0o777,
                                       })));
             }
             children.insert(OsString::from("c"), child);
@@ -1367,22 +1423,18 @@ mod test {
         assert!(fs.new_dirbuilder().mode(0o777).create("d").is_ok());
         assert!(fs == exp);
         assert!(fs.cd("..").is_ok());
-        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("a/z").unwrap_err(),
-                        EACCES()));
-        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("b/z").unwrap_err(),
-                        EACCES()));
-        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("").unwrap_err(),
-                        ENOENT()));
-        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("/").unwrap_err(),
-                        EEXIST()));
-        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("a").unwrap_err(),
-                        EEXIST()));
-        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("z/z").unwrap_err(),
-                        ENOENT()));
+        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("a/z").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("b/z").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("").unwrap_err(),    ENOENT()));
+        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("/").unwrap_err(),   EEXIST()));
+        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("a").unwrap_err(),   EEXIST()));
+        assert!(errs_eq(fs.new_dirbuilder().mode(0o777).create("z/z").unwrap_err(), ENOENT()));
     }
 
     #[test]
     fn create_dir_all() {
+        // Now that we proved mkdir works, we can setup a more complicated testing system and prove
+        // create_dir_all works.
         let fs = FS::with_mode(0o300);
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("////").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("a/b/c").is_ok());
@@ -1417,23 +1469,23 @@ mod test {
 
     #[test]
     fn open() {
+        // First, prove that open even works (even though we tested it in the first test).
+        // Then, prove all combinations of OpenOptions work as expected.
         let fs = FS::with_mode(0o700);
         let exp = FS::with_mode(0o700);
         {
             let ref mut root = exp.inner.lock().pwd;
             root.write()
-                .children
-                .as_mut()
-                .unwrap()
+                .kind
+                .dir_mut()
                 .insert(OsString::from("a"),
                         Arc::new(RwLock::new(Dirent {
-                            mode: 0o300,
-                            file: Some(Arc::new(RwLock::new(RawFile {
+                            parent: Arc::downgrade(&root),
+                            kind: DeKind::File(Arc::new(RwLock::new(RawFile {
                                 valid: true,
                                 data: vec![1, 2, 3, 4],
                             }))),
-                            parent: Arc::downgrade(&root),
-                            children: None,
+                            mode: 0o300,
                         })));
         }
         let mut file = fs.new_openopts().create(true).write(true).mode(0o300).open("a").unwrap();
@@ -1495,10 +1547,10 @@ mod test {
 
         let (t, f) = (true, false);
         let mut i = -1;
-        let mut on = || -> i32 {
-            i += 1;
-            i
-        };
+        let mut on = || -> i32 { i += 1; i };
+        // These next few blocks are a bit terse, but they test combinations of OpenOptions.
+        // The format of the boolean parameters is (r)ead, (w)rite, (a)ppend, (t)runcate,
+        // (e)xclusive [aka create_new], and (c)reate.
         //                   r, w, a, t, e, c
         // No ent...
         test_open(on(), &fs, t, t, t, f, t, t, 0o700, "", Some(ENOENT()));
@@ -1512,41 +1564,11 @@ mod test {
         test_open(on(), &fs, f, t, f, f, f, f, 0o700, "/", Some(EISDIR())); // w
 
         // Open on a directory is invalid in this code.
-        test_open(on(),
-                  &fs,
-                  t,
-                  f,
-                  f,
-                  f,
-                  f,
-                  f,
-                  0o700,
-                  "/",
-                  Some(Error::new(ErrorKind::Other, "")));
+        test_open(on(), &fs, t, f, f, f, f, f, 0o700, "/", Some(Error::new(ErrorKind::Other, "")));
 
         // New files in unreachable directories...
-        test_open(on(),
-                  &fs,
-                  f,
-                  t,
-                  f,
-                  f,
-                  t,
-                  f,
-                  0o200,
-                  "unexec/a",
-                  Some(EACCES()));
-        test_open(on(),
-                  &fs,
-                  f,
-                  t,
-                  f,
-                  f,
-                  t,
-                  f,
-                  0o200,
-                  "unwrite/a",
-                  Some(EACCES()));
+        test_open(on(), &fs, f, t, f, f, t, f, 0o200, "unexec/a", Some(EACCES()));
+        test_open(on(), &fs, f, t, f, f, t, f, 0o200, "unwrite/a", Some(EACCES()));
 
         // New files...
         test_open(on(), &fs, t, f, f, f, f, f, 0o700, "f", Some(ENOENT())); // r
@@ -1567,33 +1589,14 @@ mod test {
 
         // New files, strict perms on creation, attempt reopen with bad flags.
         test_open(on(), &fs, t, t, f, f, f, t, 0o300, "f_unread", None); // r
-        test_open(on(),
-                  &fs,
-                  t,
-                  t,
-                  f,
-                  f,
-                  f,
-                  t,
-                  0o300,
-                  "f_unread",
-                  Some(EACCES()));
+        test_open(on(), &fs, t, t, f, f, f, t, 0o300, "f_unread", Some(EACCES()));
         test_open(on(), &fs, f, t, f, f, f, t, 0o500, "f_unwrite", None); // w
-        test_open(on(),
-                  &fs,
-                  f,
-                  t,
-                  f,
-                  f,
-                  f,
-                  t,
-                  0o500,
-                  "f_unwrite",
-                  Some(EACCES()));
+        test_open(on(), &fs, f, t, f, f, f, t, 0o500, "f_unwrite", Some(EACCES()));
     }
 
     #[test]
     fn remove() {
+        // Now we have proved creating things work. Let's prove destroying things works.
         let fs = FS::with_mode(0o700);
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("unexec/subdir/d").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("a/d/e").is_ok());
@@ -1639,6 +1642,8 @@ mod test {
 
     #[test]
     fn remove_dir_all() {
+        // And now we ensure batch removes work as expected - specifically, an alphabetical remove
+        // that fails when a subdirectory is not readable.
         let fs = FS::with_mode(0o700);
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("j/k/l").is_ok());
@@ -1666,6 +1671,7 @@ mod test {
 
     #[test]
     fn rename() {
+        // Rename can fail _a lot_.
         let fs = FS::with_mode(0o700);
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("d/e").is_ok());
@@ -1700,6 +1706,7 @@ mod test {
 
     #[test]
     fn read_dir() {
+        // Rote test to ensure ReadDir iteration works and is alphabetical.
         let fs = FS::with_mode(0o700);
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).create("a/b/d").is_ok());
@@ -1709,22 +1716,22 @@ mod test {
         let mut reader = fs.read_dir("a/b").unwrap();
         assert_eq!(reader.next().unwrap().unwrap(),
                    DirEntry {
-                       dir: PathBuf::from("a/b"),
+                       dir:  PathBuf::from("a/b"),
                        base: OsString::from("c"),
                        meta: Metadata {
-                           filetype: FileType { dir: true },
-                           length: DIRLEN,
-                           perms: Permissions::from_mode(0o700),
+                           filetype: FileType(Ftyp::Dir),
+                           length:   DIRLEN,
+                           perms:    Permissions::from_mode(0o700),
                        },
                    });
         assert_eq!(reader.next().unwrap().unwrap(),
                    DirEntry {
-                       dir: PathBuf::from("a/b"),
+                       dir:  PathBuf::from("a/b"),
                        base: OsString::from("d"),
                        meta: Metadata {
-                           filetype: FileType { dir: true },
-                           length: DIRLEN,
-                           perms: Permissions::from_mode(0o300),
+                           filetype: FileType(Ftyp::Dir),
+                           length:   DIRLEN,
+                           perms:    Permissions::from_mode(0o300),
                        },
                    });
         let next = reader.next().unwrap().unwrap();
@@ -1732,18 +1739,18 @@ mod test {
         assert_eq!(next.file_name(), OsString::from("f"));
         assert_eq!(next.metadata().unwrap(),
                    Metadata {
-                       filetype: FileType { dir: false },
-                       length: 0,
-                       perms: Permissions::from_mode(0),
+                       filetype: FileType(Ftyp::File),
+                       length:   0,
+                       perms:    Permissions::from_mode(0),
                    });
         let next = reader.next().unwrap().unwrap();
         assert_eq!(next.path(), PathBuf::from("a/b/z"));
         assert_eq!(next.file_name(), OsString::from("z"));
         assert_eq!(next.metadata().unwrap(),
                    Metadata {
-                       filetype: FileType { dir: true },
-                       length: DIRLEN,
-                       perms: Permissions::from_mode(0o100),
+                       filetype: FileType(Ftyp::Dir),
+                       length:   DIRLEN,
+                       perms:    Permissions::from_mode(0o100),
                    });
         assert!(reader.next().is_none());
     }
@@ -1791,11 +1798,9 @@ mod test {
         assert!(errs_eq(raw_file.read_at(0, &mut output).unwrap_err(), ENOENT()));
     }
 
-    // This test duplicates the example at the top, but is down here for code coverage purposes and
-    // also just in case the example changes. This additionally adds some seeking and repeated
-    // read/writes to test those functions...
     #[test]
     fn test_usage() {
+        // This test tests quite a few edge conditions.
         let fs = FS::with_mode(0o300);
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
 
@@ -1806,12 +1811,12 @@ mod test {
         assert_eq!(wf.write(vec![1, 2, 3].as_slice()).unwrap(), 3);
 
         let mut rf = fs.new_openopts().read(true).open("a/f").unwrap();
-        assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
+        assert_eq!(rf.seek(SeekFrom::Current(1)).unwrap(), 1);
 
         let mut output = [0u8; 4];
         assert_eq!(rf.read(&mut output).unwrap(), 4);
         assert_eq!(&output, &[1, 2, 3, 4]);
-        assert_eq!(rf.seek(SeekFrom::Start(2)).unwrap(), 2);
+        assert_eq!(rf.seek(SeekFrom::End(-4)).unwrap(), 2);
         assert_eq!(rf.read(&mut output).unwrap(), 4);
         assert_eq!(&output, &[2, 3, 4, 5]);
 
