@@ -28,6 +28,12 @@ pub fn EACCES() -> Error {
     Error::from_raw_os_error(13)
 }
 
+/// Used when trying to modify something that is actively performing an operation.
+#[allow(non_snake_case)]
+pub fn EBUSY() -> Error {
+    Error::from_raw_os_error(16)
+}
+
 /// Used when a file or directory does not exist.
 #[allow(non_snake_case)]
 pub fn EEXIST() -> Error {
@@ -57,4 +63,10 @@ pub fn EINVAL() -> Error {
 pub fn ENOTEMPTY() -> Error {
     // TODO Windows is 41, other Unix / BSD distros differ from 39.
     Error::from_raw_os_error(39)
+}
+
+/// Used when traversing too many symlinks.
+#[allow(non_snake_case)]
+pub fn ELOOP() -> Error {
+    Error::from_raw_os_error(40)
 }
