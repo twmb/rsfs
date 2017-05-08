@@ -180,6 +180,12 @@ pub struct Parts {
     parts: Vec<Part>,
 }
 
+impl From<Part> for Parts {
+    fn from(p: Part) -> Parts {
+        Parts { at_root: false, parts: vec![p] }
+    }
+}
+
 impl Parts {
     /// Returns whether the normalized original path began with the root directory.
     pub fn at_root(&self) -> bool {
