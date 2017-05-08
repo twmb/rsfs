@@ -381,7 +381,7 @@ impl fs::OpenOptions for OpenOptions {
         self.excl = create_new; self
     }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
-        self.fs.inner.lock().open(path, self)
+        self.fs.inner.lock().open(path, self, &mut 0)
     }
 }
 
@@ -558,7 +558,7 @@ impl FS {
     /// assert!(reader.next().is_none());
     /// ```
     pub fn cd<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.inner.lock().cd(path)
+        self.inner.lock().cd(path, &mut 0)
     }
 }
 
@@ -586,7 +586,7 @@ impl fs::GenFS for FS {
         self.inner.lock().metadata(path)
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
-        self.inner.lock().read_dir(path)
+        self.inner.lock().read_dir(path, &mut 0)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.inner.lock().remove_dir(path)
@@ -601,7 +601,7 @@ impl fs::GenFS for FS {
         self.inner.lock().rename(from, to)
     }
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
-        self.inner.lock().set_permissions(path, perm.mode)
+        self.inner.lock().set_permissions(path, perm.mode, &mut 0)
     }
 
     fn new_openopts(&self) -> OpenOptions {
@@ -728,7 +728,8 @@ impl PartialEq for FileSystem {
 
 impl FileSystem {
     // up_path traverses up parent directories in a normalized path, erroring if we cannot cd into
-    // (exec) the parent directory. This function expects no symlinks from pwd to root.
+    // (exec) the parent directory. This function does nothing with symlinks, meaning if the
+    // filesystem is _inside_ of a symlink, functions with relative paths need handled somehow.
     fn up_path(&self,
                parts: path_parts::Parts)
                -> Result<(Arc<RwLock<Dirent>>, path_parts::Parts)> {
@@ -765,26 +766,79 @@ impl FileSystem {
     //
     // This returns an error if a directory we wanted to cd into is not executable (or if it is not
     // a directory).
+    //
+    // This traverses all symlinks up to the base of the input path.
     fn traverse(&self,
-                parts: path_parts::Parts)
+                parts: path_parts::Parts,
+                level: &mut u8)
                 -> Result<(Arc<RwLock<Dirent>>, Option<OsString>)> {
+        if {*level += 1; *level} == 40 {
+            return Err(ELOOP());
+        }
+        // First, we eat the parent directories. What remains will be purely normal paths.
         let (mut fs, parts) = self.up_path(parts)?;
         let mut parts_iter = parts.into_iter().peek2able();
+        // Until the base of the input path, we change down paths.
         while parts_iter.peek2().is_some() {
             if !fs.read().executable() {
                 return Err(EACCES());
             }
 
             fs = {
-                let fs = fs.read();
-                match fs.kind {
+                let borrow = fs.read();
+                match borrow.kind {
+                    // We are at a normal directory: change down into the child, if it exists.
                     DeKind::Dir(ref children) => children.get(parts_iter.next()
                                                                         .expect("peek2 is Some, next is None")
                                                                         .as_normal()
                                                                         .expect("parts_iter should be Normal after up_path"))
                                                          .cloned()
                                                          .ok_or_else(ENOENT)?,
-                    DeKind::Symlink(ref path) => unimplemented!(),
+
+                    // We are at a symlink! We have to traverse the symlink before we can continue
+                    // with parts_iter.
+                    DeKind::Symlink(ref sl) => {
+                        let (fs, may_base) = (&FileSystem {
+                            root: self.root.clone(),
+                            pwd:  fs.clone(),
+                        }).traverse(path_parts::normalize(sl), level)?;
+                        match may_base {
+                            Some(base) => {
+                                let parts: path_parts::Parts = Part::Normal(base).into();
+                                // The returned fs traversed the symlink up to the base directory.
+                                // It may now be at a symlink, that is fine.
+                                //
+                                // The symlink had a base directory that we did not traverse. We
+                                // need to push that to the front of our parts_iter.
+                                //
+                                // parts_iter is a Peek2able<path_parts::PartsIntoIter>. We can't
+                                // just blindly chain our new iterator (of one) into the existing
+                                // parts_iter because the types are different.
+                                //
+                                // Since we don't really care about inefficiencies too much (the
+                                // only reasonable usage of a symlink in an in-memory filesystem
+                                // would be for testing...), we'll just be inefficient.
+                                parts_iter = parts.into_iter()
+                                                  .chain(parts_iter)
+                                                  .collect::<path_parts::Parts>()
+                                                  .into_iter()
+                                                  .peek2able();
+                            },
+                            None => {
+                                if path_empty(sl) {
+                                    panic!("empty path in a symlink (should not be possible)");
+                                }
+                                // The symlink was either the root directory or entirely parent
+                                // directories. The returned fs is at the proper location. We do
+                                // nothing!
+                            }
+                        };
+                        // Now that we have traversed the symlink and potentially pushed its
+                        // un-traversed base path to the front of parts_iter, return fs.
+                        fs
+                    }
+
+                    // We are at a file, so we cannot traverse.
                     _ => return Err(ENOTDIR()),
                 }
             };
@@ -793,7 +847,6 @@ impl FileSystem {
             return Err(ENOTDIR());
         }
 
-        // TODO if this is a symlink, traverse it!
         match parts_iter.next() {
             Some(Part::Normal(base)) => Ok((fs, Some(base))),
             _ => Ok((fs, None)),
@@ -803,14 +856,16 @@ impl FileSystem {
     // cd changes the filesystems current working directory (cwd). TODO: we need to remember if we
     // are in a symlink. This may be "easy" by simply keeping the normalized path that we are at
     // and always appending to that at all times, cleaning up every time.
-    fn cd<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+    //
+    // This function takes a recursion level as it may be recursive if the end of path is a symlink.
+    fn cd<P: AsRef<Path>>(&mut self, path: P, level: &mut u8) -> Result<()> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
             None => {
                 if path_empty(&path) {
                     return Ok(());
-                } else {
+                } else { // the path resulted in root or parent directories only
                     self.pwd = fs;
                     return Ok(());
                 }
@@ -819,6 +874,23 @@ impl FileSystem {
         let fs = fs.read();
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
+                match child.read().kind {
+                    DeKind::File(_) => return Err(ENOTDIR()),
+                    DeKind::Symlink(ref sl) => {
+                        let og_pwd = self.pwd.clone();
+                        self.pwd = child.clone();
+                        if {*level += 1; *level} == 40 {
+                            return Err(ELOOP());
+                        }
+                        let res = self.cd(sl, level);
+                        if res.is_err() {
+                            self.pwd = og_pwd;
+                            res?;
+                        }
+                        return Ok(())
+                    },
+                    _ => (),
+                }
                 self.pwd = child.clone();
                 Ok(())
             }
@@ -826,14 +898,20 @@ impl FileSystem {
         }
     }
 
-    fn set_permissions<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+    // set_permissions implements chmod, traversing symlinks as necessary.
+    //
+    // This function takes a recursion level as it may be recursive if the end of path is a symlink.
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, mode: u32, level: &mut u8) -> Result<()> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
             None => {
                 if path_empty(&path) {
                     return Err(ENOENT());
                 } else {
+                    // symlinks are always 0o777. If traverse returns no base, path resolved to
+                    // (and fs is) either the root directory or a parent directory. This is
+                    // concrete (not a symlink), so we can set its mode.
                     fs.write().mode = mode;
                     return Ok(());
                 }
@@ -842,6 +920,18 @@ impl FileSystem {
         let fs = fs.write();
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
+                // as documented just above, we cannot change the permissions of symlinks.
+                // set_permissions on symlinks actually changes what they link to, so, well, we
+                // have to do that here.
+                if let DeKind::Symlink(ref sl) = child.read().kind {
+                    if {*level += 1; *level} == 40 {
+                        return Err(ELOOP());
+                    }
+                    return (&FileSystem{
+                        root: self.root.clone(),
+                        pwd:  child.clone(),
+                    }).set_permissions(sl, mode, level);
+                }
                 child.write().mode = mode;
                 Ok(())
             }
@@ -852,13 +942,14 @@ impl FileSystem {
     // create_dir is the base used for both mkdir and create_dir_all. create_dir_all does not fail
     // if the directory already exists.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+        let mut level = 0;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
         let base = match may_base {
             Some(base) => base,
             None => {
                 if path_empty(&path) {
                     return Err(ENOENT());
-                } else {
+                } else { // fs is at either root or a parent directory
                     if can_exist {
                         return Ok(());
                     }
@@ -907,23 +998,26 @@ impl FileSystem {
         Ok(())
     }
 
-    // http://man7.org/linux/man-pages/man2/stat.2.html
+    // I would have thought this required read permissions, but...
     //
     // "No permissions are required on the file itself, but—in the case of stat() ... execute
     // (search) permission is required on all of the directories in pathname that lead to the file.
+    //
+    // (see http://man7.org/linux/man-pages/man2/stat.2.html)
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+        let mut level = 0;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
         let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
             None => {
                 if path_empty(path) {
                     return Err(ENOENT());
-                } else {
+                } else { // this is either the root dir or a parent dir
                     return Ok(Metadata {
                         filetype: FileType(Ftyp::Dir),
-                        perms: Permissions::from_mode(fs.mode),
-                        length: DIRLEN,
+                        perms:    Permissions::from_mode(fs.mode),
+                        length:   DIRLEN,
                     });
                 }
             }
@@ -959,32 +1053,51 @@ impl FileSystem {
 
     }
 
-    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+    // read_dir implements, essentially, `ls`, traversing symlinks as necessary.
+    //
+    // This function takes a recursion level as it may be recursive if the end of path is a symlink.
+    fn read_dir<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<ReadDir> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
             None => {
                 if path_empty(&path) {
                     return Err(ENOENT());
-                } else {
+                } else { // path resolved to root or parent paths
                     return ReadDir::new(&path, &*fs);
                 }
             }
         };
 
         match fs.kind.dir_ref().get(&base) {
-            Some(child) => ReadDir::new(&path, &*child.read()),
+            Some(child) => {
+                let borrow = child.read();
+                // If the base of the path is a symlink, we ReadDir that.
+                if let DeKind::Symlink(ref sl) = borrow.kind {
+                    if {*level += 1; *level} == 40 {
+                        return Err(ELOOP());
+                    }
+                    return (&FileSystem {
+                        root: self.root.clone(),
+                        pwd:  child.clone(),
+                    }).read_dir(sl, level);
+                }
+                // Otherwise, we ReadDir whatever this is. ReadDir::new bails with ENOTDIR if it is
+                // given a file.
+                ReadDir::new(&path, &borrow)
+            },
             None => Err(ENOENT()),
         }
     }
 
     fn remove<P: AsRef<Path>>(&self, path: P, kind: FileType) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+        let mut level = 0;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
         let base = may_base.ok_or_else(|| if path_empty(&path) {
                                               ENOENT()
                                           } else {
-                                              EACCES()
+                                              ENOTEMPTY()
                                           })?;
 
         {
@@ -995,18 +1108,17 @@ impl FileSystem {
         }
 
         // We need to make sure that the FileType being requested for removal matches the FileType
-        // of the directory. Scope this check to let the non mutable borrow drop before removing.
+        // of the directory. Scope this check so it drops before we mutate.
         {
-            let child = fs.read();
-            let child = child
-                          .kind
+            let fs = fs.read();
+            let child = fs.kind
                           .dir_ref()
                           .get(&base)
                           .ok_or_else(ENOENT)?
                           .read();
 
             match kind.0 {
-                // TODO is this correct for Symlink?
+                // Symlinks and files are just simply removed, but directories must be empty.
                 Ftyp::File | Ftyp::Symlink => if child.is_dir() { return Err(EISDIR()); },
                 Ftyp::Dir => {
                     if !child.is_dir() {
@@ -1042,6 +1154,8 @@ impl FileSystem {
                         return Err(EACCES());
                     }
 
+                    // We recursively remove until we encounter an error. Only after recursing do
+                    // we remove everything from fs's HashMap that we successfully deleted.
                     let mut deleted = Vec::new();
                     let res: Result<()> = {
                         let mut child_names = Vec::new();
@@ -1051,28 +1165,35 @@ impl FileSystem {
                         // recursive removes work alphabetically
                         child_names.sort_by_key(|&(k, _)| k);
 
+                        let mut err = None;
                         for &(child_name, child) in &child_names {
                             match recursive_remove(child.clone()) {
                                 Ok(_) => deleted.push(child_name.clone()),
-                                Err(e) => return Err(e),
+                                Err(e) => {
+                                    err = Some(e);
+                                    break;
+                                },
                             }
                         }
-                        Ok(())
+                        match err {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        }
                     };
+                    // We have to remove everything we successfully recursively deleted.
                     for child_name in deleted {
                         children.remove(&child_name);
                     }
                     res?
                 }
                 DeKind::File(ref mut f) => f.write().invalidate(),
-                DeKind::Symlink(_) => unimplemented!(), // TODO: this should just be a no-op?
-                                                        //       symlinks aren't followed in
-                                                        //       recursive removes
+                DeKind::Symlink(_) => (), // symlinks are never recursively traversed
             }
             Ok(())
         }
 
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+        let mut level = 0;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
         match may_base {
             Some(base) => { // removing a non-root path
                 let mut fs = fs.write();
@@ -1085,10 +1206,12 @@ impl FileSystem {
                     child.remove();
                 }
             }
-            None => { // removing everything under root
+            None => { // removing either a direct parent directory or everything under root.
                 if path_empty(&path) {
                     return Err(ENOENT());
                 }
+                // TODO we can remove the fs under us. This is valid, but future IO operations
+                // should completely fail unless we are at root and root is what remains.
                 recursive_remove(fs.clone())?;
             }
         }
@@ -1096,14 +1219,24 @@ impl FileSystem {
     }
 
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from))?;
+        let mut level = 0;
+        let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from), &mut level)?;
         let old_base = old_may_base.ok_or_else(|| if path_empty(&from) {
                                                       ENOENT()
                                                   } else {
-                                                      Error::new(ErrorKind::Other,
-                                                                 "rename of root unimplemented")
+                                                      if !Arc::ptr_eq(&old_fs, &self.root) {
+                                                          // Renaming purely through parent
+                                                          // directories returns EBUSY.
+                                                          EBUSY()
+                                                      } else {
+                                                          // I really don't want to support this,
+                                                          // nor manually test what can happen.
+                                                          Error::new(ErrorKind::Other,
+                                                                     "rename of root unimplemented")
+                                                      }
                                                   })?;
-        let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to))?;
+        level = 0;
+        let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to), &mut level)?;
         let new_base =
             new_may_base.ok_or_else(|| if path_empty(&to) { ENOENT() } else { EEXIST() })?;
 
@@ -1165,7 +1298,7 @@ impl FileSystem {
         Ok(())
     }
 
-    fn open<P: AsRef<Path>>(&self, path: P, options: &OpenOptions) -> Result<File> {
+    fn open<P: AsRef<Path>>(&self, path: P, options: &OpenOptions, level: &mut u8) -> Result<File> {
         // We have create, create_new, read, write, truncate, append.
         //   - append implies write
         //   - create_new (excl) implies create
@@ -1187,13 +1320,14 @@ impl FileSystem {
         }
 
         // Now, on with (potentially) opening.
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path))?;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
             None => {
                 if path_empty(&path) {
                     return Err(ENOENT());
-                } else {
+                } else { // root or parent directories only (both of which,
+                         // being dirs, fail immediately in open_existing)
                     return open_existing(&fs, &options);
                 }
             }
@@ -1204,6 +1338,16 @@ impl FileSystem {
 
         // If the file exists, open it.
         if let Some(child) = fs.read().kind.dir_ref().get(&base) {
+            if let DeKind::Symlink(ref sl) = child.read().kind {
+                // Bummer, the base of our path is a symlink. Open that.
+                if {*level += 1; *level} == 40 {
+                    return Err(ELOOP());
+                }
+                return (&FileSystem {
+                    root: self.root.clone(),
+                    pwd:  fs.clone(),
+                }).open(sl, &options, level);
+            }
             return open_existing(child, &options);
         }
 
@@ -1249,11 +1393,12 @@ fn open_existing(fs: &Arc<RwLock<Dirent>>, options: &OpenOptions) -> Result<File
     }
 
     let fs = fs.read();
+    // we panic below if fs is a symlink
     if fs.is_dir() {
         if options.write {
             return Err(EISDIR());
         }
-        // TODO we could return Ok here so that users can stat the file, but that is more
+        // TODO we could return Ok here so that users can stat the File, but that is more
         // complicated than seems worth it. Reads fail with "Is a directory", and right now
         // there is no hook into RawFile with how to fail reads.
         return Err(Error::new(ErrorKind::Other, "open on directory unimplemented"));
@@ -1439,6 +1584,7 @@ mod test {
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("////").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("a/b/c").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("/a/b/c/").is_ok());
+        assert!(fs.new_dirbuilder().recursive(true).create("..").is_ok());
         assert!(errs_eq(fs.new_dirbuilder()
                           .mode(0o100)
                           .recursive(true)
@@ -1493,6 +1639,7 @@ mod test {
 
         assert!(fs.new_dirbuilder().mode(0o100).create("unwrite").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("unexec/subdir").is_ok());
+        assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("okdir").is_ok());
         assert!(fs.set_permissions("unexec", Permissions::from_mode(0o200)).is_ok());
 
         assert!(errs_eq(fs.new_openopts().write(true).open("").unwrap_err(),
@@ -1565,6 +1712,9 @@ mod test {
 
         // Open on a directory is invalid in this code.
         test_open(on(), &fs, t, f, f, f, f, f, 0o700, "/", Some(Error::new(ErrorKind::Other, "")));
+        assert!(fs.cd("okdir").is_ok());
+        test_open(on(), &fs, t, f, f, f, f, f, 0o700, "..", Some(Error::new(ErrorKind::Other, "")));
+        assert!(fs.cd("..").is_ok());
 
         // New files in unreachable directories...
         test_open(on(), &fs, f, t, f, f, t, f, 0o200, "unexec/a", Some(EACCES()));
@@ -1619,14 +1769,18 @@ mod test {
                         EEXIST()));
 
         assert!(errs_eq(fs.remove_dir("").unwrap_err(), ENOENT()));
-        assert!(errs_eq(fs.remove_dir("/").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.remove_dir("/").unwrap_err(), ENOTEMPTY()));
         assert!(errs_eq(fs.remove_dir("unexec/subdir").unwrap_err(), EACCES()));
         assert!(errs_eq(fs.remove_dir("unexec/subdir/d").unwrap_err(), EACCES()));
 
+        assert!(fs.cd("a").is_ok());
+        assert!(errs_eq(fs.remove_dir("..").unwrap_err(), ENOTEMPTY()));
+        assert!(fs.cd("..").is_ok());
         assert!(errs_eq(fs.remove_dir("a/c/z").unwrap_err(), ENOTDIR()));
         assert!(errs_eq(fs.remove_dir("a/z").unwrap_err(), ENOENT()));
         assert!(errs_eq(fs.remove_dir("a/d").unwrap_err(), ENOTEMPTY()));
 
+        assert!(errs_eq(fs.cd("a/c").unwrap_err(), ENOTDIR()));
         assert!(fs.cd("a/d").is_ok()); // cd and do some relative removes
 
         assert!(fs.remove_file("../c").is_ok());
@@ -1661,7 +1815,7 @@ mod test {
 
         assert!(errs_eq(fs.remove_dir_all("").unwrap_err(), ENOENT()));
         assert!(fs.remove_dir_all("a").is_ok());
-        assert!(fs.remove_dir_all("j").is_ok());
+        assert!(errs_eq(fs.remove_dir_all("..").unwrap_err(), EACCES()));
         assert!(errs_eq(fs.remove_dir_all("x").unwrap_err(), EACCES()));
 
         let exp = FS::with_mode(0o700);
