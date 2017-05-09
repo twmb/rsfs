@@ -1096,8 +1096,7 @@ impl FileSystem {
 
     // create_dir creates directories, failing is the directory exists and can_exist is false.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
-        let mut level = 0;
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         let base = match may_base {
             Some(base) => base,
             None => {
@@ -1354,8 +1353,7 @@ impl FileSystem {
     }
 
     fn remove<P: AsRef<Path>>(&self, path: P, kind: FileType) -> Result<()> {
-        let mut level = 0;
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         let base = may_base.ok_or_else(|| if path_empty(&path) {
                                               ENOENT()
                                           } else {
@@ -1454,8 +1452,7 @@ impl FileSystem {
             Ok(())
         }
 
-        let mut level = 0;
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         match may_base {
             Some(base) => { // removing a non-root path
                 let mut fs = fs.write();
@@ -1481,24 +1478,20 @@ impl FileSystem {
     }
 
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        let mut level = 0;
-        let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from), &mut level)?;
+        let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from), &mut 0)?;
         let old_base = old_may_base.ok_or_else(|| if path_empty(&from) {
                                                       ENOENT()
-                                                  } else {
-                                                      if !Arc::ptr_eq(&old_fs, &self.root) {
+                                                  } else if !Arc::ptr_eq(&old_fs, &self.root) {
                                                           // Renaming purely through parent
                                                           // directories returns EBUSY.
                                                           EBUSY()
-                                                      } else {
-                                                          // I really don't want to support this,
-                                                          // nor manually test what can happen.
-                                                          Error::new(ErrorKind::Other,
-                                                                     "rename of root unimplemented")
-                                                      }
+                                                  } else {
+                                                      // I really don't want to support this,
+                                                      // nor manually test what can happen.
+                                                      Error::new(ErrorKind::Other,
+                                                                 "rename of root unimplemented")
                                                   })?;
-        level = 0;
-        let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to), &mut level)?;
+        let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to), &mut 0)?;
         let new_base =
             new_may_base.ok_or_else(|| if path_empty(&to) { ENOENT() } else { EEXIST() })?;
 
