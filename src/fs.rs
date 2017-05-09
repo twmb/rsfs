@@ -159,7 +159,17 @@ pub trait GenFS {
     /// ReadDir is an associated type until traits can return `impl Trait`.
     type ReadDir: Iterator<Item = Result<Self::DirEntry>>;
 
+    fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64>;
+
+    /// Creates a new, empty directory at the provided path.
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result<()>;
+
+    /// Recursively creates a directory and all its parent components if they are missing.
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()>;
+
     /// Returns metadata information of the file or directory at path.
+    ///
+    /// This function will traverse symbolic links to query a directory or file.
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata>;
 
     /// Returns an iterator over entries within a directory.

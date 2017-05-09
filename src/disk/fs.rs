@@ -294,11 +294,21 @@ pub struct FS;
 impl fs::GenFS for FS {
     type DirBuilder = DirBuilder;
     type DirEntry = DirEntry;
+    type File = File;
     type Metadata = Metadata;
     type OpenOptions = OpenOptions;
     type Permissions = Permissions;
     type ReadDir = ReadDir;
 
+    fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
+        rs_fs::copy(from, to)
+    }
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        rs_fs::create_dir(path)
+    }
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        rs_fs::create_dir_all(path)
+    }
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
         rs_fs::metadata(path).map(Metadata)
     }

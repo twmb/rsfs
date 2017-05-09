@@ -705,10 +705,59 @@ impl fs::GenFS for FS {
     type Permissions = Permissions;
     type ReadDir     = ReadDir;
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
-        self.inner.lock().metadata(path)
+    fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
+        // std::fs's copy actually uses std::fs functions to implement copy, which is nice. We will
+        // repeat that pattern here. First, though, we have to validate that `from` is actually a
+        // file. We do that first and return the same std::fs error if it is not.
+        fn not_file() -> Error {
+            Error::new(ErrorKind::InvalidInput, "the source path is not an existing regular file")
+        }
+
+        let (from, to) = (from.as_ref(), to.as_ref());
+
+        // Now we do our "is file" checking, scoping the lock, because most other functions below
+        // this scope each use a lock.
+        {
+            let fs = self.inner.lock();
+            let (fs, may_base) = fs.traverse(path_parts::normalize(&from), &mut 0)?;
+            let base = may_base.ok_or_else(not_file)?;
+
+            let fs = fs.read();
+            if !fs.executable() {
+                return Err(EACCES());
+            }
+            if let Some(child) = fs.kind.dir_ref().get(&base) {
+                match child.read().kind {
+                    DeKind::File(_) => (),
+                    _ => return Err(not_file())
+                }
+            }
+        }
+
+        // Now we do what std::fs does. Note that the open on from is technically a race: a second
+        // process could come in, remove from, and create a symlink with the same name. That would
+        // be the only potential problem. The end result would be that the symlink's target is
+        // copied, which really isn't a huge deal. If the race changed from to a directory, the
+        // io::copy would fail, as reads on directories fail immediately.
+        use fs::OpenOptions;
+        let mut reader = self.new_openopts().read(true).open(from)?;
+        let mut writer = self.new_openopts().write(true).truncate(true).create(true).open(from)?;
+        use fs::File;
+        let perm = reader.metadata()?.permissions();
+        let ret = io::copy(&mut reader, &mut writer)?;
+        self.set_permissions(to, perm)?;
+        Ok(ret)
     }
-    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.new_dirbuilder().create(path)
+    }
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.new_dirbuilder().recursive(true).create(path)
+    }
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
+        self.inner.lock().metadata(path, &mut 0)
+    }
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir> {
         self.inner.lock().read_dir(path, &mut 0)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -727,7 +776,7 @@ impl fs::GenFS for FS {
         self.inner.lock().set_permissions(path, perm.mode, &mut 0)
     }
 
-    fn new_openopts(&self) -> OpenOptions {
+    fn new_openopts(&self) -> Self::OpenOptions {
         OpenOptions {
             fs:     self.clone(),
             read:   false,
@@ -739,7 +788,7 @@ impl fs::GenFS for FS {
             mode:   0o666, // default per unix_ext
         }
     }
-    fn new_dirbuilder(&self) -> DirBuilder {
+    fn new_dirbuilder(&self) -> Self::DirBuilder {
         DirBuilder {
             fs: self.clone(),
 
