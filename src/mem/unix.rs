@@ -213,59 +213,92 @@ impl RawFile {
 /// See the module [documentation] for a comprehensive example.
 ///
 /// [documentation]: index.html
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct File {
+    // fields that allow us to set_permissions...
+    fs:   FS,
+    path: PathBuf,
+
     read:   bool,
     write:  bool,
     append: bool,
 
     metadata: Metadata,
 
+    cursor: Arc<Mutex<FileCursor>>,
+}
+
+// FileCursor corresponds to an actual file descriptor, which, "behind the scenes", keeps track of
+// where we are in a file.
+#[derive(Debug)]
+struct FileCursor {
     file: Arc<RwLock<RawFile>>,
     at:   usize,
 }
 
 impl fs::File for File {
-    type Metadata = Metadata;
+    type Metadata    = Metadata;
+    type Permissions = Permissions;
 
+    fn sync_all(&self) -> Result<()> {
+        Ok(())
+    }
+    fn sync_data(&self) -> Result<()> {
+        Ok(())
+    }
+    fn set_len(&self, size: u64) -> Result<()> {
+        if !self.write {
+            return Err(EINVAL());
+        }
+        Ok(self.cursor.lock().set_len(size)?)
+    }
     fn metadata(&self) -> Result<Self::Metadata> {
         Ok(self.metadata)
     }
-}
-
-impl Read for File {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if !self.read {
-            return Err(EBADF());
-        }
-        let n_read = self.file.read().read_at(self.at, buf)?;
-        self.at += n_read;
-        Ok(n_read)
+    fn try_clone(&self) -> Result<Self> {
+        Ok(self.clone())
+    }
+    fn set_permissions(&self, perm: Self::Permissions) -> Result<()> {
+        use fs::GenFS;
+        Ok(self.fs.set_permissions(&self.path, perm)?)
     }
 }
 
-impl Write for File {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        if !self.write {
-            return Err(EBADF());
-        }
+impl FileCursor {
+    fn set_len(&mut self, size: u64) -> Result<()> {
         let mut file = self.file.write();
-        if self.append {
-            self.at = file.data.len();
-        }
-        let n_wrote = file.write_at(self.at, buf)?;
-        self.at += n_wrote;
-        Ok(n_wrote)
-    }
-    fn flush(&mut self) -> Result<()> {
-        if !self.write {
-            return Err(EBADF());
+        let size = size as usize;
+        match file.data.len().cmp(&size) {
+            Ordering::Less => {
+                // If data is smaller, create a longer Vec and copy the original contents over.
+                let mut new = vec![0; size];
+                new[..file.data.len()].copy_from_slice(&file.data);
+                file.data = new;
+            }
+            // If data is longer, simply truncate it.
+            Ordering::Greater => file.data.truncate(size),
+            // Truncate to the length data is? Do nothing!
+            _ => (),
         }
         Ok(())
     }
-}
 
-impl Seek for File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let n = self.file.read().read_at(self.at, buf)?;
+        self.at += n;
+        Ok(n)
+    }
+
+    fn write(&mut self, buf: &[u8], append: bool) -> Result<usize> {
+        let mut file = self.file.write();
+        if append {
+            self.at = file.data.len();
+        }
+        let n = file.write_at(self.at, buf)?;
+        self.at += n;
+        Ok(n)
+    }
+
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let file = self.file.write();
         let len = file.data.len();
@@ -293,6 +326,84 @@ impl Seek for File {
                 Ok(at_end as u64)
             }
         }
+    }
+}
+
+impl Read for File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if !self.read {
+            return Err(EBADF());
+        }
+        Ok(self.cursor.lock().read(buf)?)
+    }
+}
+impl Write for File {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        if !self.write {
+            return Err(EBADF());
+        }
+        Ok(self.cursor.lock().write(buf, self.append)?)
+    }
+    fn flush(&mut self) -> Result<()> {
+        if !self.write {
+            return Err(EBADF());
+        }
+        Ok(())
+    }
+}
+impl Seek for File {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        Ok(self.cursor.lock().seek(pos)?)
+    }
+}
+
+// now we duplicate our impls for a &'a File - this is necessary because we can call mutable
+// functions (read, write, flush, seek) on a file reference.
+
+impl<'a> Read for &'a File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if !self.read {
+            return Err(EBADF());
+        }
+        Ok(self.cursor.lock().read(buf)?)
+    }
+}
+impl<'a> Write for &'a File {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        if !self.write {
+            return Err(EBADF());
+        }
+        Ok(self.cursor.lock().write(buf, self.append)?)
+    }
+    fn flush(&mut self) -> Result<()> {
+        if !self.write {
+            return Err(EBADF());
+        }
+        Ok(())
+    }
+}
+impl<'a> Seek for &'a File {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        Ok(self.cursor.lock().seek(pos)?)
+    }
+}
+
+impl unix_ext::FileExt for File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if !self.read {
+            return Err(EBADF());
+        }
+        let cursor = self.cursor.lock();
+        let file = cursor.file.read();
+        Ok(file.read_at(offset as usize, buf)?)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize> {
+        if !self.write {
+            return Err(EBADF());
+        }
+        let cursor = self.cursor.lock();
+        let mut file = cursor.file.write();
+        Ok(file.write_at(offset as usize, buf)?)
     }
 }
 
@@ -392,7 +503,7 @@ impl fs::OpenOptions for OpenOptions {
         self.excl = create_new; self
     }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
-        self.fs.inner.lock().open(path, self, &mut 0)
+        self.fs.inner.lock().open(self.fs.clone(), path, self, &mut 0)
     }
 }
 
@@ -1304,7 +1415,11 @@ impl FileSystem {
         }
     }
 
+    // open has to take the master filesystem (FS) because File itself can call set_permissions.
+    // There is probably an avenue to clean this up.
     fn open<P: AsRef<Path>>(&self,
+                            master_fs: FS,
+                            path: P,
                             options: &OpenOptions,
                             level: &mut u8)
                             -> Result<File> {
@@ -1337,7 +1452,7 @@ impl FileSystem {
                     return Err(ENOENT());
                 } else { // root or parent directories only (both of which,
                          // being dirs, fail immediately in open_existing)
-                    return Self::open_existing(&fs, &options);
+                    return Self::open_existing(master_fs, path, &fs, &options);
                 }
             }
         };
@@ -1355,9 +1470,9 @@ impl FileSystem {
                 return (&FileSystem {
                     root: self.root.clone(),
                     pwd:  fs.clone(),
-                }).open(sl, &options, level);
+                }).open(master_fs, sl, &options, level);
             }
-            return Self::open_existing(child, &options);
+            return Self::open_existing(master_fs, path, child, &options);
         }
 
         // From here down, we worry about creating a new file.
@@ -1378,6 +1493,9 @@ impl FileSystem {
         }));
         fs.write().kind.dir_mut().insert(base, child);
         Ok(File { // file view
+            fs:   master_fs,
+            path: path.as_ref().to_owned(),
+
             read:   options.read,
             write:  options.write,
             append: options.append,
@@ -1388,14 +1506,19 @@ impl FileSystem {
                 perms:    Permissions::from_mode(options.mode),
             },
 
-            file: file.clone(),
-            at:   0,
+            cursor: Arc::new(Mutex::new(FileCursor {
+                file: file.clone(),
+                at:   0,
+            })),
         })
     }
 
     // `open_existing` opens known existing file with the given options, returning an error if the
-    // file cannot be opened with those options.
-    fn open_existing<P: AsRef<Path>>(fs: &Arc<RwLock<Dirent>>,
+    // file cannot be opened with those options. This takes the master filesystem (FS) for the same
+    // reason open does: a File has set_permissions, which needs the FS...
+    fn open_existing<P: AsRef<Path>>(master_fs: FS,
+                                     path: P,
+                                     fs: &Arc<RwLock<Dirent>>,
                                      options: &OpenOptions)
                                      -> Result<File> {
         if options.excl {
@@ -1439,6 +1562,9 @@ impl FileSystem {
             (arc_file, len)
         };
         Ok(File {
+            fs:   master_fs,
+            path: path.as_ref().to_owned(),
+
             read:   read,
             write:  write,
             append: options.append,
@@ -1448,8 +1574,11 @@ impl FileSystem {
                 length: len as u64,
                 perms: Permissions::from_mode(options.mode),
             },
-            file: file,
-            at:   0,
+
+            cursor: Arc::new(Mutex::new(FileCursor {
+                file: file,
+                at:   0,
+            })),
         })
     }
 }
