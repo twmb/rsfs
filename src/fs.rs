@@ -161,6 +161,8 @@ pub trait GenFS {
     /// ReadDir is an associated type until traits can return `impl Trait`.
     type ReadDir: Iterator<Item = Result<Self::DirEntry>>;
 
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
+
     fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64>;
 
     /// Creates a new, empty directory at the provided path.

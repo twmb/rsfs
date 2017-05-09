@@ -647,6 +647,7 @@ impl FS {
             parent: Weak::new(),
             kind:   DeKind::Dir(HashMap::new()),
             mode:   mode,
+            name:   OsString::from(""),
         }));
         FS {
             inner: Arc::new(Mutex::new(FileSystem {
@@ -709,6 +710,9 @@ impl fs::GenFS for FS {
     type Permissions = Permissions;
     type ReadDir     = ReadDir;
 
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        self.inner.lock().canonicalize(path, &mut 0)
+    }
     fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
         // std::fs's copy actually uses std::fs functions to implement copy, which is nice. We will
         // repeat that pattern here. First, though, we have to validate that `from` is actually a
@@ -861,6 +865,7 @@ struct Dirent {
     parent: Weak<RwLock<Dirent>>,
     kind:   DeKind,
     mode:   u32,
+    name:   OsString,
 }
 
 impl Dirent {
@@ -898,7 +903,8 @@ impl PartialEq for FileSystem {
         fn eq_at(l: Arc<RwLock<Dirent>>, r: Arc<RwLock<Dirent>>) -> bool {
             let l = l.read();
             let r = r.read();
-            if l.mode != r.mode {
+            if l.mode != r.mode ||
+                l.name != r.name {
                 return false;
             }
             match (&l.kind, &r.kind) {
@@ -1098,6 +1104,70 @@ impl FileSystem {
         }
     }
 
+    // This implements fs::canonicalize. It's a bit ugly, but we do what we gotta do. FileSystem
+    // has no direct path down to a dirent, so we have to find where the end of the path is and
+    // build the resulting path backwards to the root directory.
+    //
+    // This function is the _only_ reason Dirent's have `name`.
+    fn canonicalize<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<PathBuf> {
+        fn build_from_fs(mut fs: Arc<RwLock<Dirent>>) -> Result<PathBuf> {
+            let mut rev = Vec::new();
+            loop {
+                if fs.read().name.len() == 0 {
+                    break
+                }
+                fs = {
+                    rev.push(fs.read().name.clone());
+                    let fs = fs.read();
+                    fs.parent
+                      .upgrade()
+                      .as_ref()
+                      .cloned()
+                      .expect("a non-root directory should have a parent, only root has no name")
+                }
+            }
+            rev.reverse();
+            let mut pb = PathBuf::from("/");
+            for p in rev {
+                pb.push(p)
+            }
+            Ok(pb)
+        }
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
+        let base = match may_base {
+            Some(base) => base,
+            None => {
+                if path_empty(&path) {
+                    return Err(ENOENT());
+                }
+                return build_from_fs(fs);
+            }
+        };
+
+        let fs = fs.read();
+        if !fs.executable() {
+            return Err(EACCES());
+        }
+
+        match fs.kind.dir_ref().get(&base) {
+            Some(child) => {
+                let borrow = child.read();
+                if let DeKind::Symlink(ref sl) = borrow.kind {
+                    if {*level += 1; *level} == 40 {
+                        return Err(ELOOP());
+                    }
+                    return (&FileSystem {
+                        root: self.root.clone(),
+                        pwd:  child.clone(),
+                    }).canonicalize(sl, level);
+                }
+                build_from_fs(child.clone())
+            },
+            None => Err(ENOENT()),
+        }
+
+    }
+
     // create_dir creates directories, failing is the directory exists and can_exist is false.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
@@ -1123,7 +1193,7 @@ impl FileSystem {
         }
 
         let mut borrow = fs.write();
-        match borrow.kind.dir_mut().entry(base) {
+        match borrow.kind.dir_mut().entry(base.clone()) {
             Entry::Occupied(o) => {
                 if can_exist && o.get().read().is_dir() {
                     return Ok(());
@@ -1135,6 +1205,7 @@ impl FileSystem {
                     parent: Arc::downgrade(&fs),
                     kind:   DeKind::Dir(HashMap::new()),
                     mode:   mode,
+                    name:   base,
                 })));
                 Ok(())
             }
@@ -1187,22 +1258,24 @@ impl FileSystem {
             DeKind::Symlink(ref sl) => if dst_exists {
                 Err(EEXIST())
             } else {
-                dst_fs.write().kind.dir_mut().insert(dst_base,
+                dst_fs.write().kind.dir_mut().insert(dst_base.clone(),
                                                      Arc::new(RwLock::new(Dirent {
                                                          parent: Arc::downgrade(&dst_fs),
                                                          kind:   DeKind::Symlink(sl.clone()),
                                                          mode:   src_child.mode, // always 0o777
+                                                         name:   dst_base,
                                                      })));
                 Ok(())
             },
             DeKind::File(ref f) => if dst_exists {
                 Err(EEXIST())
             } else {
-                dst_fs.write().kind.dir_mut().insert(dst_base,
+                dst_fs.write().kind.dir_mut().insert(dst_base.clone(),
                                                      Arc::new(RwLock::new(Dirent {
                                                          parent: Arc::downgrade(&dst_fs),
                                                          kind:   DeKind::File(f.clone()),
                                                          mode:   src_child.mode,
+                                                         name:   dst_base,
                                                      })));
                 Ok(())
             }
@@ -1226,11 +1299,12 @@ impl FileSystem {
             }
         }
 
-        dst_fs.write().kind.dir_mut().insert(dst_base,
+        dst_fs.write().kind.dir_mut().insert(dst_base.clone(),
                                              Arc::new(RwLock::new(Dirent {
                                                  parent: Arc::downgrade(&dst_fs),
                                                  kind:   DeKind::Symlink(src.as_ref().to_owned()),
                                                  mode:   0o777, // symlink modes are always 0o777
+                                                 name:   dst_base,
                                              })));
         Ok(())
     }
@@ -1553,6 +1627,7 @@ impl FileSystem {
 
         let removed = old_fs.write().kind.dir_mut().remove(&old_base)
                                               .expect("logic verifying dirent existence is wrong");
+        removed.write().name = new_base.clone();
         new_fs.write().kind.dir_mut().insert(new_base, removed);
         Ok(())
     }
@@ -1720,6 +1795,7 @@ impl FileSystem {
             parent: Arc::downgrade(&fs),
             kind:   DeKind::File(file.clone()),
             mode:   options.mode,
+            name:   base.clone(),
         }));
         fs.write().kind.dir_mut().insert(base, child);
         Ok(File { // file view
@@ -1838,6 +1914,7 @@ mod test {
             parent: Weak::new(),
             kind:   DeKind::Dir(HashMap::new()),
             mode:   0,
+            name:   OsString::from(""),
         }));
 
         let exp = FS {
@@ -1855,6 +1932,7 @@ mod test {
                             parent: Arc::downgrade(&root_rc),
                             kind:   DeKind::Dir(HashMap::new()),
                             mode:   0o666,
+                            name:   OsString::from("lolz"),
                         })));
             dir.insert(OsString::from("f"),
                         Arc::new(RwLock::new(Dirent{
@@ -1864,6 +1942,7 @@ mod test {
                                 data:  vec![1, 2, 3],
                             }))),
                             mode:   0o334,
+                            name:   OsString::from("f"),
                         })));
         }
 
@@ -1883,6 +1962,7 @@ mod test {
             parent: Weak::new(),
             kind:   DeKind::Dir(HashMap::new()),
             mode:   0o300,
+            name:   OsString::from(""),
         }));
         let exp = FS {
             inner: Arc::new(Mutex::new(FileSystem {
@@ -1900,17 +1980,20 @@ mod test {
                                 parent: Arc::downgrade(&root),
                                 kind:   DeKind::Dir(HashMap::new()),
                                 mode:   0o500, // r-x: cannot create subfiles
+                                name:   OsString::from("a"),
                             })));
             children.insert(OsString::from("b"),
                             Arc::new(RwLock::new(Dirent {
                                 parent: Arc::downgrade(&root),
                                 kind:   DeKind::Dir(HashMap::new()),
                                 mode:   0o600, // rw-: cannot exec (cd) into to create subfiles
+                                name:   OsString::from("b"),
                             })));
             let child = Arc::new(RwLock::new(Dirent {
                 parent: Arc::downgrade(&root),
                 kind:   DeKind::Dir(HashMap::new()),
                 mode:   0o300, // _wx: all we need
+                name:   OsString::from("c"),
             }));
             {
                 let mut child_borrow = child.write();
@@ -1920,6 +2003,7 @@ mod test {
                                           parent: Arc::downgrade(&child),
                                           kind:   DeKind::Dir(HashMap::new()),
                                           mode:   0o777,
+                                          name:   OsString::from("d"),
                                       })));
             }
             children.insert(OsString::from("c"), child);
@@ -2003,6 +2087,7 @@ mod test {
                                 data: vec![1, 2, 3, 4],
                             }))),
                             mode: 0o300,
+                            name: OsString::from("a"),
                         })));
         }
         let mut file = fs.new_openopts().create(true).write(true).mode(0o300).open("a").unwrap();

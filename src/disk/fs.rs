@@ -297,6 +297,9 @@ impl fs::GenFS for FS {
     type Permissions = Permissions;
     type ReadDir = ReadDir;
 
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        rs_fs::canonicalize(path)
+    }
     fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
         rs_fs::copy(from, to)
     }
