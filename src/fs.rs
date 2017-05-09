@@ -167,6 +167,9 @@ pub trait GenFS {
     /// Recursively creates a directory and all its parent components if they are missing.
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()>;
 
+    /// TODO doc, as well as examples for everything, and errors
+    fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()>;
+
     /// Returns metadata information of the file or directory at path.
     ///
     /// This function will traverse symbolic links to query a directory or file.
@@ -174,6 +177,9 @@ pub trait GenFS {
 
     /// Returns an iterator over entries within a directory.
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir>;
+
+    // TODO doc and examples
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf>;
 
     /// Removes an existing, empty directory.
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()>;
@@ -190,6 +196,9 @@ pub trait GenFS {
 
     /// Changes the permissions of a file or directory.
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()>;
+
+    /// TODO
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata>;
 
     /// Returns a new OpenOptions for a file for this filesytem.
     ///

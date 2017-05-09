@@ -309,11 +309,17 @@ impl fs::GenFS for FS {
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         rs_fs::create_dir_all(path)
     }
+    fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        rs_fs::hard_link(src, dst)
+    }
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
         rs_fs::metadata(path).map(Metadata)
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir> {
         rs_fs::read_dir(path).map(ReadDir)
+    }
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        rs_fs::read_link(path)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         rs_fs::remove_dir(path)
@@ -329,6 +335,9 @@ impl fs::GenFS for FS {
     }
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
         rs_fs::set_permissions(path, perm.0)
+    }
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
+        rs_fs::symlink_metadata(path).map(Metadata)
     }
     fn new_openopts(&self) -> Self::OpenOptions {
         OpenOptions(rs_fs::OpenOptions::new())

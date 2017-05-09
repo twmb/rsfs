@@ -754,11 +754,17 @@ impl fs::GenFS for FS {
     fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.new_dirbuilder().recursive(true).create(path)
     }
+    fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        self.inner.lock().hard_link(src, dst)
+    }
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
         self.inner.lock().metadata(path, &mut 0)
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir> {
         self.inner.lock().read_dir(path, &mut 0)
+    }
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        self.inner.lock().read_link(path)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.inner.lock().remove_dir(path)
@@ -774,6 +780,9 @@ impl fs::GenFS for FS {
     }
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
         self.inner.lock().set_permissions(path, perm.mode, &mut 0)
+    }
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
+        self.inner.lock().symlink_metadata(path)
     }
 
     fn new_openopts(&self) -> Self::OpenOptions {
@@ -1133,6 +1142,64 @@ impl FileSystem {
         Ok(())
     }
 
+    fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        let (src_fs, src_may_base) = self.traverse(path_parts::normalize(&src), &mut 0)?;
+        let src_base = src_may_base.ok_or_else(EPERM)?; // I don't know why it is EPERM, but it is.
+        let (dst_fs, dst_may_base) = self.traverse(path_parts::normalize(&dst), &mut 0)?;
+        let dst_base = dst_may_base.ok_or_else(EEXIST)?;
+
+        let src_fs = src_fs.read();
+        if !src_fs.executable() {
+            return Err(EACCES());
+        }
+
+        {
+            let dst_fs = dst_fs.read();
+            if !dst_fs.executable() || !dst_fs.writable() {
+                return Err(EACCES());
+            }
+        }
+
+        // We could do a bunch of nested match arms here, but we'll just clone. Efficiency is not
+        // a virtue in this module yet.
+        let src_child = match src_fs.kind.dir_ref().get(&src_base) {
+            Some(child) => child.clone(),
+            None => return Err(ENOENT()),
+        };
+
+        let dst_exists = match dst_fs.read().kind.dir_ref().get(&dst_base) {
+            Some(_) => true,
+            None => false
+        };
+
+        let src_child = src_child.read();
+        match src_child.kind {
+            DeKind::Dir(_) => Err(EPERM()),
+            DeKind::Symlink(ref sl) => if dst_exists {
+                Err(EEXIST())
+            } else {
+                dst_fs.write().kind.dir_mut().insert(dst_base,
+                                                     Arc::new(RwLock::new(Dirent {
+                                                         parent: Arc::downgrade(&dst_fs),
+                                                         kind:   DeKind::Symlink(sl.clone()),
+                                                         mode:   src_child.mode, // always 0o777
+                                                     })));
+                Ok(())
+            },
+            DeKind::File(ref f) => if dst_exists {
+                Err(EEXIST())
+            } else {
+                dst_fs.write().kind.dir_mut().insert(dst_base,
+                                                     Arc::new(RwLock::new(Dirent {
+                                                         parent: Arc::downgrade(&dst_fs),
+                                                         kind:   DeKind::File(f.clone()),
+                                                         mode:   src_child.mode,
+                                                     })));
+                Ok(())
+            }
+        }
+    }
+
     // I would have thought this required read permissions, but...
     //
     // "No permissions are required on the file itself, but—in the case of stat() ... execute
@@ -1222,6 +1289,29 @@ impl FileSystem {
                 // given a file.
                 ReadDir::new(&path, &borrow)
             },
+            None => Err(ENOENT()),
+        }
+    }
+
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
+        let base = may_base.ok_or_else(|| if path_empty(&path) {
+                                              ENOENT()
+                                          } else {
+                                              EINVAL()
+                                          })?;
+        let fs = fs.read();
+        if !fs.readable() {
+            return Err(EACCES());
+        }
+        match fs.kind.dir_ref().get(&base) {
+            Some(child) => {
+                let child = child.read();
+                match child.kind {
+                    DeKind::Symlink(ref sl) => Ok(sl.clone()),
+                    _ => Err(EINVAL()),
+                }
+            }
             None => Err(ENOENT()),
         }
     }
@@ -1469,6 +1559,53 @@ impl FileSystem {
                 }
                 child.write().mode = mode;
                 Ok(())
+            }
+            None => Err(ENOENT()),
+        }
+    }
+
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
+        let fs = fs.read();
+        let base = match may_base {
+            Some(base) => base,
+            None => {
+                if path_empty(path) {
+                    return Err(ENOENT());
+                } else { // this is either the root dir or a parent dir
+                    return Ok(Metadata {
+                        filetype: FileType(Ftyp::Dir),
+                        perms:    Permissions::from_mode(fs.mode),
+                        length:   DIRLEN,
+                    });
+                }
+            }
+        };
+
+        if !fs.executable() {
+            return Err(EACCES());
+        }
+
+        match fs.kind.dir_ref().get(&base) {
+            Some(child) => {
+                let child = child.read();
+                Ok(match child.kind {
+                    DeKind::Dir(_) => Metadata {
+                        filetype: FileType(Ftyp::Dir),
+                        length:   DIRLEN,
+                        perms:    Permissions::from_mode(child.mode),
+                    },
+                    DeKind::File(ref f) => Metadata {
+                        filetype: FileType(Ftyp::File),
+                        length:   f.read().data.len() as u64,
+                        perms:    Permissions::from_mode(child.mode),
+                    },
+                    DeKind::Symlink(_) => Metadata {
+                        filetype: FileType(Ftyp::Symlink),
+                        length:   SYMLEN,
+                        perms:    Permissions::from_mode(child.mode),
+                    },
+                })
             }
             None => Err(ENOENT()),
         }
