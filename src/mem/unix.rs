@@ -104,7 +104,7 @@ impl fs::DirBuilder for DirBuilder {
         if self.recursive {
             self.fs.inner.lock().create_dir_all(path, self.mode)
         } else {
-            self.fs.inner.lock().mkdir(path, self.mode)
+            self.fs.inner.lock().create_dir(path, self.mode, false)
         }
     }
 }
@@ -939,8 +939,7 @@ impl FileSystem {
         }
     }
 
-    // create_dir is the base used for both mkdir and create_dir_all. create_dir_all does not fail
-    // if the directory already exists.
+    // create_dir creates directories, failing is the directory exists and can_exist is false.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
         let mut level = 0;
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
@@ -982,10 +981,6 @@ impl FileSystem {
                 Ok(())
             }
         }
-    }
-
-    fn mkdir<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
-        self.create_dir(path, mode, false)
     }
 
     fn create_dir_all<P: AsRef<Path>>(&self, path: P, mode: u32) -> Result<()> {
@@ -1505,9 +1500,9 @@ mod test {
     }
 
     #[test]
-    fn mkdir() {
+    fn create_dir() {
         // We just proved that file system comparisons work. Let's build a slightly more
-        // complicated filesystem and then prove mkdir works.
+        // complicated filesystem and then prove create_dir works.
         let exp_pwd = Arc::new(RwLock::new(Dirent {
             parent: Weak::new(),
             kind:   DeKind::Dir(HashMap::new()),
@@ -1578,8 +1573,8 @@ mod test {
 
     #[test]
     fn create_dir_all() {
-        // Now that we proved mkdir works, we can setup a more complicated testing system and prove
-        // create_dir_all works.
+        // Now that we proved create_dir works, we can setup a more complicated testing system and
+        // prove create_dir_all works.
         let fs = FS::with_mode(0o300);
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("////").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("a/b/c").is_ok());
@@ -1763,8 +1758,8 @@ mod test {
         //     └--subdir/
         //         └--d/
 
-        // While we are here, quickly test that mkdir on an existing file fails - we did not test
-        // above in mkdir as we were, at the time, proving mkdir worked exactly.
+        // While we are here, quickly test that create_dir on an existing file fails - we did not
+        // test above in create_dir as we were, at the time, proving create_dir worked exactly.
         assert!(errs_eq(fs.new_dirbuilder().mode(0o300).create("a/c").unwrap_err(),
                         EEXIST()));
 
