@@ -36,6 +36,7 @@ pub trait OpenOptionsExt {
     ///
     /// The default mode for new files is 0o666.
     fn mode(&mut self, mode: u32) -> &mut Self;
+    fn custom_flags(&mut self, flags: i32) -> &mut Self;
 }
 
 /// A Unix specific [`rsfs::Permissions`] extension.

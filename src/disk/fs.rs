@@ -234,6 +234,8 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.0.mode(mode); self
     }
+    fn custom_flags(&mut self, flags: i32) -> &mut Self {
+        self.0.custom_flags(flags); self
     }
 }
 

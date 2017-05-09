@@ -511,6 +511,10 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
     fn mode(&mut self, mode: u32) -> &mut Self {
         self.mode = mode; self
     }
+    fn custom_flags(&mut self, _: i32) -> &mut Self {
+        // we do nothing with these flags yet
+        self
+    }
 }
 
 /// Iterator over entries in a directory.
