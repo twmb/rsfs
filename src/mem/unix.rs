@@ -909,47 +909,6 @@ impl FileSystem {
         }
     }
 
-    // set_permissions implements chmod, traversing symlinks as necessary.
-    //
-    // This function takes a recursion level as it may be recursive if the end of path is a symlink.
-    fn set_permissions<P: AsRef<Path>>(&self, path: P, mode: u32, level: &mut u8) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
-        let base = match may_base {
-            Some(base) => base,
-            None => {
-                if path_empty(&path) {
-                    return Err(ENOENT());
-                } else {
-                    // symlinks are always 0o777. If traverse returns no base, path resolved to
-                    // (and fs is) either the root directory or a parent directory. This is
-                    // concrete (not a symlink), so we can set its mode.
-                    fs.write().mode = mode;
-                    return Ok(());
-                }
-            }
-        };
-        let fs = fs.write();
-        match fs.kind.dir_ref().get(&base) {
-            Some(child) => {
-                // as documented just above, we cannot change the permissions of symlinks.
-                // set_permissions on symlinks actually changes what they link to, so, well, we
-                // have to do that here.
-                if let DeKind::Symlink(ref sl) = child.read().kind {
-                    if {*level += 1; *level} == 40 {
-                        return Err(ELOOP());
-                    }
-                    return (&FileSystem{
-                        root: self.root.clone(),
-                        pwd:  child.clone(),
-                    }).set_permissions(sl, mode, level);
-                }
-                child.write().mode = mode;
-                Ok(())
-            }
-            None => Err(ENOENT()),
-        }
-    }
-
     // create_dir creates directories, failing is the directory exists and can_exist is false.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
         let mut level = 0;
@@ -1304,7 +1263,51 @@ impl FileSystem {
         Ok(())
     }
 
-    fn open<P: AsRef<Path>>(&self, path: P, options: &OpenOptions, level: &mut u8) -> Result<File> {
+    // set_permissions implements chmod, traversing symlinks as necessary.
+    //
+    // This function takes a recursion level as it may be recursive if the end of path is a symlink.
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, mode: u32, level: &mut u8) -> Result<()> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
+        let base = match may_base {
+            Some(base) => base,
+            None => {
+                if path_empty(&path) {
+                    return Err(ENOENT());
+                } else {
+                    // symlinks are always 0o777. If traverse returns no base, path resolved to
+                    // (and fs is) either the root directory or a parent directory. This is
+                    // concrete (not a symlink), so we can set its mode.
+                    fs.write().mode = mode;
+                    return Ok(());
+                }
+            }
+        };
+        let fs = fs.write();
+        match fs.kind.dir_ref().get(&base) {
+            Some(child) => {
+                // as documented just above, we cannot change the permissions of symlinks.
+                // set_permissions on symlinks actually changes what they link to, so, well, we
+                // have to do that here.
+                if let DeKind::Symlink(ref sl) = child.read().kind {
+                    if {*level += 1; *level} == 40 {
+                        return Err(ELOOP());
+                    }
+                    return (&FileSystem{
+                        root: self.root.clone(),
+                        pwd:  child.clone(),
+                    }).set_permissions(sl, mode, level);
+                }
+                child.write().mode = mode;
+                Ok(())
+            }
+            None => Err(ENOENT()),
+        }
+    }
+
+    fn open<P: AsRef<Path>>(&self,
+                            options: &OpenOptions,
+                            level: &mut u8)
+                            -> Result<File> {
         // We have create, create_new, read, write, truncate, append.
         //   - append implies write
         //   - create_new (excl) implies create
@@ -1334,7 +1337,7 @@ impl FileSystem {
                     return Err(ENOENT());
                 } else { // root or parent directories only (both of which,
                          // being dirs, fail immediately in open_existing)
-                    return open_existing(&fs, &options);
+                    return Self::open_existing(&fs, &options);
                 }
             }
         };
@@ -1354,7 +1357,7 @@ impl FileSystem {
                     pwd:  fs.clone(),
                 }).open(sl, &options, level);
             }
-            return open_existing(child, &options);
+            return Self::open_existing(child, &options);
         }
 
         // From here down, we worry about creating a new file.
@@ -1389,63 +1392,66 @@ impl FileSystem {
             at:   0,
         })
     }
-}
 
-// `open_existing` opens known existing file with the given options, returning an error if the file
-// cannot be opened with those options.
-fn open_existing(fs: &Arc<RwLock<Dirent>>, options: &OpenOptions) -> Result<File> {
-    if options.excl {
-        return Err(EEXIST());
-    }
+    // `open_existing` opens known existing file with the given options, returning an error if the
+    // file cannot be opened with those options.
+    fn open_existing<P: AsRef<Path>>(fs: &Arc<RwLock<Dirent>>,
+                                     options: &OpenOptions)
+                                     -> Result<File> {
+        if options.excl {
+            return Err(EEXIST());
+        }
 
-    let fs = fs.read();
-    // we panic below if fs is a symlink
-    if fs.is_dir() {
-        if options.write {
-            return Err(EISDIR());
-        }
-        // TODO we could return Ok here so that users can stat the File, but that is more
-        // complicated than seems worth it. Reads fail with "Is a directory", and right now
-        // there is no hook into RawFile with how to fail reads.
-        return Err(Error::new(ErrorKind::Other, "open on directory unimplemented"));
-    }
-
-    let (mut read, mut write) = (false, false);
-    if options.read {
-        if !fs.readable() {
-            return Err(EACCES());
-        }
-        read = true;
-    }
-    if options.write {
-        if !fs.writable() {
-            return Err(EACCES());
-        }
-        write = true;
-    }
-    let (file, len) = {
-        let arc_file = fs.kind.file_ref().clone();
-        let len = {
-            let mut raw_file = arc_file.write();
-            if options.trunc {
-                raw_file.data = Vec::new();
+        let fs = fs.read();
+        // we panic below if fs is a symlink
+        if fs.is_dir() {
+            if options.write {
+                return Err(EISDIR());
             }
-            raw_file.data.len()
+            // TODO we could return Ok here so that users can stat the File, but that is more
+            // complicated than seems worth it. Reads fail with "Is a directory", and right now
+            // there is no hook into RawFile with how to fail reads.
+            return Err(Error::new(ErrorKind::Other, "open on directory unimplemented"));
+        }
+
+        let (mut read, mut write) = (false, false);
+        if options.read {
+            if !fs.readable() {
+                return Err(EACCES());
+            }
+            read = true;
+        }
+        if options.write {
+            if !fs.writable() {
+                return Err(EACCES());
+            }
+            write = true;
+        }
+        let (file, len) = {
+            let arc_file = fs.kind.file_ref().clone();
+            let len = {
+                let mut raw_file = arc_file.write();
+                if options.trunc {
+                    raw_file.data = Vec::new();
+                }
+                raw_file.data.len()
+            };
+            (arc_file, len)
         };
-        (arc_file, len)
-    };
-    Ok(File {
-        read: read,
-        write: write,
-        append: options.append,
-        metadata: Metadata {
-            filetype: FileType(Ftyp::File),
-            length: len as u64,
-            perms: Permissions::from_mode(options.mode),
-        },
-        file: file,
-        at: 0,
-    })
+        Ok(File {
+            read:   read,
+            write:  write,
+            append: options.append,
+
+            metadata: Metadata {
+                filetype: FileType(Ftyp::File),
+                length: len as u64,
+                perms: Permissions::from_mode(options.mode),
+            },
+            file: file,
+            at:   0,
+        })
+    }
 }
 
 #[cfg(test)]
