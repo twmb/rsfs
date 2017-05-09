@@ -90,6 +90,9 @@ impl fs::FileType for FileType {
     fn is_file(&self) -> bool {
         self.0.is_file()
     }
+    fn is_symlink(&self) -> bool {
+        self.0.is_symlink()
+    }
 }
 
 /// A single element tuple containing a [`std::fs::File`].
@@ -350,5 +353,12 @@ impl fs::GenFS for FS {
     }
     fn file_create<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
         rs_fs::File::create(path).map(File)
+    }
+}
+
+#[cfg(unix)]
+impl unix_ext::FSExt for FS {
+    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        ::std::os::unix::fs::symlink(src, dst)
     }
 }

@@ -426,9 +426,9 @@ impl fs::FileType for FileType {
     fn is_file(&self) -> bool {
         self.0 == Ftyp::File
     }
-    //fn is_symlink(&self) -> bool {
-    //    self.0 == Ftyp::Symlink
-    //}
+    fn is_symlink(&self) -> bool {
+        self.0 == Ftyp::Symlink
+    }
 }
 
 /// Metadata information about a file.
@@ -816,6 +816,12 @@ impl fs::GenFS for FS {
     }
 }
 
+impl unix_ext::FSExt for FS {
+    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        self.inner.lock().symlink(src, dst)
+    }
+}
+
 // DeKind differentiates between files, directories, and symlinks.
 #[derive(Debug)]
 enum DeKind {
@@ -1200,15 +1206,46 @@ impl FileSystem {
         }
     }
 
+    // symlink itself is an incredibly easy function to implement, so long as all the scaffolding
+    // handling symlinks properly for directory traversal is already in place.
+    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        let (dst_fs, dst_may_base) = self.traverse(path_parts::normalize(&dst), &mut 0)?;
+        let dst_base = dst_may_base.ok_or_else(EEXIST)?;
+
+        {
+            let dst_fs = dst_fs.read();
+            if !dst_fs.executable() || !dst_fs.writable() {
+                return Err(EACCES());
+            }
+
+            if dst_fs.kind.dir_ref().get(&dst_base).is_some() {
+                return Err(EEXIST());
+            }
+        }
+
+        dst_fs.write().kind.dir_mut().insert(dst_base,
+                                             Arc::new(RwLock::new(Dirent {
+                                                 parent: Arc::downgrade(&dst_fs),
+                                                 kind:   DeKind::Symlink(src.as_ref().to_owned()),
+                                                 mode:   0o777, // symlink modes are always 0o777
+                                             })));
+        Ok(())
+    }
+
     // I would have thought this required read permissions, but...
     //
     // "No permissions are required on the file itself, but—in the case of stat() ... execute
     // (search) permission is required on all of the directories in pathname that lead to the file.
     //
     // (see http://man7.org/linux/man-pages/man2/stat.2.html)
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
-        let mut level = 0;
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut level)?;
+    //
+    // This function is almost an exact duplicate of symlink_metadata. The only change comes in
+    // when the base of the path if a symlink. Here, we recursively traverse it. I don't
+    // particularaly want to figure out how to refactor the two to use the same code yet; my hunch
+    // is that weaving through the recursion level through symlink_metadata and this and then
+    // trying to parse the returned metadata and path name would be a bit convoluted.
+    fn metadata<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<Metadata> {
+        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
@@ -1243,16 +1280,16 @@ impl FileSystem {
                         length:   f.read().data.len() as u64,
                         perms:    Permissions::from_mode(child.mode),
                     },
-                    DeKind::Symlink(_) => Metadata {
-                        filetype: FileType(Ftyp::Symlink),
-                        length:   SYMLEN,
-                        perms:    Permissions::from_mode(child.mode),
-                    },
+                    DeKind::Symlink(ref sl) => {
+                        if {*level += 1; *level} == 40 {
+                            return Err(ELOOP());
+                        }
+                        self.metadata(sl, level)?
+                    }
                 })
             }
             None => Err(ENOENT()),
         }
-
     }
 
     // read_dir implements, essentially, `ls`, traversing symlinks as necessary.

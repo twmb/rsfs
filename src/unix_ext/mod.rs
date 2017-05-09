@@ -17,6 +17,9 @@
 //!
 //! [`rsfs`]: ../index.html
 
+use std::io::Result;
+use std::path::Path;
+
 /// A Unix specific [`rsfs::DirBuilder`] extension.
 ///
 /// [`rsfs::DirBuilder`]: ../trait.DirBuilder.html
@@ -55,4 +58,9 @@ pub trait PermissionsExt {
 pub trait FileExt {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize>;
+}
+
+pub trait FSExt {
+    // TODO doc
+    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()>;
 }

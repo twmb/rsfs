@@ -67,6 +67,8 @@ pub trait FileType {
     fn is_dir(&self) -> bool;
     /// Returns whether this file type is a file.
     fn is_file(&self) -> bool;
+    /// TODO doc and examples
+    fn is_symlink(&self) -> bool;
 }
 
 /// Metadata information about a file.
