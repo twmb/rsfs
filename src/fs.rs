@@ -46,12 +46,19 @@ pub trait DirEntry {
 /// deliberately left out as, on most systems, it is a noop or worse yet, a lie. A proper sync, to
 /// ensure data is 100% truly on disk, requires a complicated sequence that is different on most
 /// systems.
-pub trait File: Read + Seek + Write {
+pub trait File: Read + Seek + Write + Sized {
     /// Metadata is an associated type until traits can return `impl Trait`.
     type Metadata: Metadata;
+    /// Permissions is an associated type until traits can return `impl Trait`.
+    type Permissions: Permissions;
 
+    fn sync_all(&self) -> Result<()>;
+    fn sync_data(&self) -> Result<()>;
+    fn set_len(&self, size: u64) -> Result<()>;
     /// Queries information about the underlying file.
     fn metadata(&self) -> Result<Self::Metadata>;
+    fn try_clone(&self) -> Result<Self>;
+    fn set_permissions(&self, perm: Self::Permissions) -> Result<()>;
 }
 
 /// Represents the type of a file.
@@ -141,6 +148,8 @@ pub trait GenFS {
     type DirBuilder: DirBuilder;
     /// DirEntry is an associated type until traits can return `impl Trait`.
     type DirEntry: DirEntry;
+    /// File is an associated type until traits can return `impl Trait`.
+    type File: File;
     /// Metadata is an associated type until traits can return `impl Trait`.
     type Metadata: Metadata;
     /// OpenOptions is an associated type until traits can return `impl Trait`.
@@ -187,4 +196,8 @@ pub trait GenFS {
     ///
     /// [`std::fs::DirBuilder::new()`]: https://doc.rust-lang.org/std/fs/struct.DirBuilder.html#method.new
     fn new_dirbuilder(&self) -> Self::DirBuilder;
+
+    /// TODO doc, clean all docs.
+    fn file_open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File>;
+    fn file_create<P: AsRef<Path>>(&self, path: P) -> Result<Self::File>;
 }

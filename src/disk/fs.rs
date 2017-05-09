@@ -21,7 +21,7 @@
 use std::ffi::OsString;
 use std::fs as rs_fs;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fs;
@@ -100,9 +100,25 @@ pub struct File(rs_fs::File);
 
 impl fs::File for File {
     type Metadata = Metadata;
+    type Permissions = Permissions;
 
+    fn sync_all(&self) -> Result<()> {
+        self.0.sync_all()
+    }
+    fn sync_data(&self) -> Result<()> {
+        self.0.sync_data()
+    }
+    fn set_len(&self, size: u64) -> Result<()> {
+        self.0.set_len(size)
+    }
     fn metadata(&self) -> Result<Self::Metadata> {
         self.0.metadata().map(Metadata)
+    }
+    fn try_clone(&self) -> Result<Self> {
+        self.0.try_clone().map(File)
+    }
+    fn set_permissions(&self, perm: Self::Permissions) -> Result<()> {
+        self.0.set_permissions(perm.0)
     }
 }
 
@@ -309,5 +325,11 @@ impl fs::GenFS for FS {
     }
     fn new_dirbuilder(&self) -> Self::DirBuilder {
         DirBuilder(rs_fs::DirBuilder::new())
+    }
+    fn file_open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        rs_fs::File::open(path).map(File)
+    }
+    fn file_create<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        rs_fs::File::create(path).map(File)
     }
 }

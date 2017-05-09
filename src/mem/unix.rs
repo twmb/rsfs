@@ -63,12 +63,12 @@ use std::cmp::{self, Ordering};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::OsString;
-use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
+use std::io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::vec::IntoIter;
 
-use fs::{self, FileType as _FileType, Metadata as _Metadata};
+use fs::{self, DirBuilder as _DirBuilder, FileType as _FileType, Metadata as _Metadata};
 use unix_ext::{self, PermissionsExt as _PermissionsExt};
 
 use errors::*;
@@ -699,6 +699,7 @@ impl PartialEq for FS {
 impl fs::GenFS for FS {
     type DirBuilder  = DirBuilder;
     type DirEntry    = DirEntry;
+    type File        = File;
     type Metadata    = Metadata;
     type OpenOptions = OpenOptions;
     type Permissions = Permissions;
@@ -745,6 +746,15 @@ impl fs::GenFS for FS {
             recursive: false,
             mode:      0o777, // default per unix_ext
         }
+    }
+
+    fn file_open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        use fs::OpenOptions;
+        self.new_openopts().read(true).open(path.as_ref())
+    }
+    fn file_create<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        use fs::OpenOptions;
+        self.new_openopts().write(true).create(true).truncate(true).open(path.as_ref())
     }
 }
 
@@ -1586,7 +1596,7 @@ impl FileSystem {
 #[cfg(test)]
 mod test {
     use super::*;
-    use fs::{DirBuilder, DirEntry as DirEntryTrait, File, GenFS, OpenOptions};
+    use fs::{DirEntry as DirEntryTrait, File, GenFS, OpenOptions};
     use std::ffi::OsString;
     use std::io::Error;
     use std::sync::mpsc;
