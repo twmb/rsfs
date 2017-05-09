@@ -9,6 +9,12 @@
 
 use std::io::Error;
 
+/// Used when an operation is not permitted.
+#[allow(non_snake_case)]
+pub fn EPERM() -> Error {
+    Error::from_raw_os_error(1)
+}
+
 /// Used when a file or directory does not exist.
 #[allow(non_snake_case)]
 pub fn ENOENT() -> Error {
