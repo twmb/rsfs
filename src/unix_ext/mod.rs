@@ -51,3 +51,8 @@ pub trait PermissionsExt {
     /// Creates a new Permissions from the given Unix mode.
     fn from_mode(mode: u32) -> Self;
 }
+
+pub trait FileExt {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize>;
+}

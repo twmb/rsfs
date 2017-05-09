@@ -111,7 +111,6 @@ impl Read for File {
         self.0.read(buf)
     }
 }
-
 impl Write for File {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         self.0.write(buf)
@@ -120,10 +119,37 @@ impl Write for File {
         Ok(())
     }
 }
-
 impl Seek for File {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         self.0.seek(pos)
+    }
+}
+
+impl<'a> Read for &'a File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (&self.0).read(buf)
+    }
+}
+impl<'a> Write for &'a File {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (&self.0).write(buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+impl<'a> Seek for &'a File {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        (&self.0).seek(pos)
+    }
+}
+
+impl unix_ext::FileExt for File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.0.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize> {
+        self.0.write_at(buf, offset)
     }
 }
 
