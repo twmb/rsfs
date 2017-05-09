@@ -162,23 +162,34 @@ impl RawFile {
             return Err(ENOENT());
         }
 
-        let unread = &self.data[at..];
+        let data = &self.data;
+        if at > data.len() {
+            return Ok(0);
+        }
+
+        let unread = &data[at..];
         let copy_size = cmp::min(dst.len(), unread.len());
 
         dst[..copy_size].copy_from_slice(&unread[..copy_size]);
         Ok(copy_size)
     }
 
-    // write_at writes to the RawFile at a given index, which must be at or less than `data.len()`.
+    // write_at writes to the RawFile at a given index.
     fn write_at(&mut self, at: usize, src: &[u8]) -> Result<usize> {
         if !self.valid {
             return Err(ENOENT());
         }
 
         let mut dst = &mut self.data;
+
+        if at > dst.len() {
+            let new = vec![0; at + src.len()];
+            *dst = new;
+        }
+
         let new_end = src.len() + at;
 
-        if dst.len() > new_end {
+        if dst.len() >= new_end {
             dst[at..new_end].copy_from_slice(src);
         } else {
             dst.truncate(at);
