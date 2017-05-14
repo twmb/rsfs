@@ -79,7 +79,6 @@ use path_parts::{self, IteratorExt, Part};
 use ptr::Raw;
 
 // TODO File could be tested more, maybe, but the raw_file seems sufficient.
-// Permissions and FileType can be tested directly - right now they are tested indirectly.
 // How much can be refactored so that Windows support can be easily added?
 
 // DIRLEN is the length returned from Metadata's len() call for a directory. This is pulled from
@@ -661,6 +660,38 @@ impl Iterator for ReadDir {
 #[derive(Clone, Debug)]
 pub struct FS(Arc<Mutex<FileSystem>>);
 
+impl fmt::Display for FS {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let fs = self.0.lock();
+        let root = fs.root;
+
+        write!(f, "\nfilesystem\n----------\n")?;
+
+        fn wr(f: &mut fmt::Formatter, d: Raw<Dirent>, level: u32) -> fmt::Result {
+            for _ in 0..level {
+                write!(f, "    ")?;
+            }
+            let name = d.name.as_os_str().to_str().expect("expected utf8 dirent name");
+            let inode = d.inode.view();
+            match d.kind {
+                DeKind::Dir(ref children) => {
+                    write!(f, "{}/ -- {:o} (len: {})\n",
+                        name, inode.perms.0, inode.length)?;
+                    for child in children.values() {
+                        wr(f, *child, level+1)?;
+                    }
+                    write!(f, "")
+                }
+                DeKind::File(_) => write!(f, "{} -- {:o} (len: {})\n",
+                        name, inode.perms.0, inode.length),
+                DeKind::Symlink(ref sl) => write!(f, "{}@->[{}] -- {:o} (len:{})\n",
+                        name, sl.clone().to_str().unwrap(), inode.perms.0, inode.length),
+            }
+        }
+        wr(f, root, 0)
+    }
+}
+
 impl FS {
     /// Creates an empty `FS` with mode `0o777`.
     pub fn new() -> FS {
@@ -719,12 +750,6 @@ impl Default for FS {
     }
 }
 
-impl PartialEq for FS {
-    fn eq(&self, other: &Self) -> bool {
-        *self.0.lock() == *other.0.lock()
-    }
-}
-
 impl fs::GenFS for FS {
     type DirBuilder  = DirBuilder;
     type DirEntry    = DirEntry;
@@ -757,11 +782,12 @@ impl fs::GenFS for FS {
             if !fs.executable() {
                 return Err(EACCES());
             }
-            if let Some(child) = fs.kind.dir_ref().get(&base) {
-                match child.kind {
+            match fs.kind.dir_ref().get(&base) {
+                Some(child) => match child.kind {
                     DeKind::File(_) => (),
-                    _ => return Err(not_file())
-                }
+                    _ => return Err(not_file()),
+                },
+                None => return Err(not_file()),
             }
         }
 
@@ -773,7 +799,7 @@ impl fs::GenFS for FS {
         // (also see https://github.com/rust-lang/rust/issues/37885)
         use fs::OpenOptions;
         let mut reader = self.new_openopts().read(true).open(from)?;
-        let mut writer = self.new_openopts().write(true).truncate(true).create(true).open(from)?;
+        let mut writer = self.new_openopts().write(true).truncate(true).create(true).open(to)?;
         use fs::File;
         let perm = reader.metadata()?.permissions();
         let ret = io::copy(&mut reader, &mut writer)?;
@@ -793,7 +819,7 @@ impl fs::GenFS for FS {
         self.0.lock().metadata(path, &mut 0)
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir> {
-        self.0.lock().read_dir(path, &mut 0)
+        self.0.lock().read_dir(&path, &path, &mut 0)
     }
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
         self.0.lock().read_link(path)
@@ -1095,7 +1121,7 @@ fn path_empty<P: AsRef<Path>>(path: P) -> bool {
 impl PartialEq for FileSystem {
     fn eq(&self, other: &Self) -> bool {
         fn eq_at(l: Raw<Dirent>, r: Raw<Dirent>) -> bool {
-            if l.inode.perms() != r.inode.perms() ||
+            if l.inode.view() != r.inode.view() ||
                 l.name != r.name {
                 return false;
             }
@@ -1177,75 +1203,71 @@ impl Pwd {
         // First, we eat the parent directories. What remains will be purely normal paths.
         let (mut fs, parts) = self.up_path(parts)?;
         let mut parts_iter = parts.into_iter().peek2able();
-        // Until the base of the input path, we change down paths.
-        while parts_iter.peek2().is_some() {
-            fs = {
-                if !fs.executable() {
-                    return Err(EACCES());
-                }
-                match fs.kind {
-                    // We are at a normal directory: change down into the child, if it exists.
-                    DeKind::Dir(ref children) => children
-                                                 .get(parts_iter
-                                                      .next()
-                                                      .expect("peek2 is Some, next is None")
-                                                      .as_normal()
-                                                      .expect("parts_iter should be Normal after up_path"))
-                                                 .cloned()
-                                                 .ok_or_else(ENOENT)?,
 
-                    // We are at a symlink! We have to traverse the symlink before we can continue
-                    // with parts_iter.
-                    DeKind::Symlink(ref sl) => {
-                        let (fs, may_base) = Pwd(fs).traverse(path_parts::normalize(sl), level)?;
-                        match may_base {
-                            Some(base) => {
-                                let parts: path_parts::Parts = Part::Normal(base).into();
-                                // The returned fs traversed the symlink up to the base directory.
-                                // It may now be at a symlink, that is fine.
-                                //
-                                // The symlink had a base directory that we did not traverse. We
-                                // need to push that to the front of our parts_iter.
-                                //
-                                // parts_iter is a Peek2able<path_parts::PartsIntoIter>. We can't
-                                // just blindly chain our new iterator (of one) into the existing
-                                // parts_iter because the types are different.
-                                //
-                                // Since we don't really care about inefficiencies too much (the
-                                // only reasonable usage of a symlink in an in-memory filesystem
-                                // would be for testing...), we'll just be inefficient.
-                                parts_iter = parts.into_iter()
-                                                  .chain(parts_iter)
-                                                  .collect::<path_parts::Parts>()
-                                                  .into_iter()
-                                                  .peek2able();
-                            },
-                            None => {
-                                if path_empty(sl) {
-                                    panic!("empty path in a symlink (should not be possible)");
-                                }
-                                // The symlink was either the root directory or entirely parent
-                                // directories. The returned fs is at the proper location. We do
-                                // nothing!
-                            }
-                        };
-                        // Now that we have traversed the symlink and potentially pushed its
-                        // un-traversed base path to the front of parts_iter, return fs.
-                        fs
+        loop {
+            let on = fs; // copy fs to not double borrow it
+            match on.kind {
+                DeKind::Dir(ref children) => {
+                    // If there are not two more entries, we are just before the base. Return.
+                    if !parts_iter.peek2().is_some() {
+                        match parts_iter.next() {
+                            Some(Part::Normal(base)) => return Ok((fs, Some(base))),
+                            _ => return Ok((fs, None)),
+                        }
                     }
-
-                    // We are at a file, so we cannot traverse.
-                    _ => return Err(ENOTDIR()),
+                    // If at a dir, we need executable.
+                    if !fs.executable() {
+                        return Err(EACCES());
+                    }
+                    // Now, change into the next directory if it exists.
+                    fs = children.get(parts_iter
+                                      .next()
+                                      .expect("peek2 is Some, next is None")
+                                      .as_normal()
+                                      .expect("parts_iter should be Normal after up_path"))
+                                  .cloned()
+                                  .ok_or_else(ENOENT)?;
                 }
-            };
-        }
-        if !fs.is_dir() {
-            return Err(ENOTDIR());
-        }
-
-        match parts_iter.next() {
-            Some(Part::Normal(base)) => Ok((fs, Some(base))),
-            _ => Ok((fs, None)),
+                DeKind::Symlink(ref sl) => {
+                    // We are at a symlink! We have to traverse the symlink before we can continue
+                    // with parts_iter. We traverse a symlink _from_ its parent, and we must set
+                    // fs to the traversed fs when it is done.
+                    fs = fs.parent.expect("symlinks should always have a parent");
+                    let (new_fs, may_base) = Pwd(fs).traverse(path_parts::normalize(sl), level)?;
+                    fs = new_fs;
+                    match may_base {
+                        Some(base) => {
+                            let parts: path_parts::Parts = Part::Normal(base).into();
+                            // The returned fs traversed the symlink up to the base directory.
+                            // That base directory may be a symlink, which is fine, because our
+                            // intent here now is to push that new base into the front of
+                            // parts_iter.
+                            //
+                            // parts_iter is a Peek2able<path_parts::PartsIntoIter>. We can't just
+                            // blindly chain our new iterator (of one) into the existing parts_iter
+                            // because the types are different.
+                            //
+                            // Since we don't really care about inefficiencies too much for
+                            // symlinks ( only reasonable usage of a symlink in an in-memory
+                            // filesystem would be for testing...), we'll just be inefficient.
+                            parts_iter = parts.into_iter()
+                                              .chain(parts_iter)
+                                              .collect::<path_parts::Parts>()
+                                              .into_iter()
+                                              .peek2able();
+                        },
+                        None => {
+                            if path_empty(sl) {
+                                panic!("empty path in a symlink (should not be possible)");
+                            }
+                            // The symlink was either the root directory or entirely parent
+                            // directories. We set fs above to the proper location. We do
+                            // nothing!
+                        }
+                    }
+                }
+                _ => return Err(ENOTDIR()),
+            }
         }
     }
 
@@ -1258,18 +1280,17 @@ impl Pwd {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(&path) {
-                    return Ok(());
-                } else { // the path resulted in root or parent directories only
-                    self.0 = fs;
-                    return Ok(());
-                }
+            None => if path_empty(&path) {
+                return Ok(());
+            } else { // the path resulted in root or parent directories only
+                self.0 = fs;
+                return Ok(());
             }
         };
         if !fs.executable() {
             return Err(EACCES());
         }
+        let parent = fs;
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 self.0 = match child.kind {
@@ -1278,7 +1299,7 @@ impl Pwd {
                         if {*level += 1; *level} == 40 {
                             return Err(ELOOP());
                         }
-                        let mut ephemeral = Pwd(*child);
+                        let mut ephemeral = Pwd(parent);
                         ephemeral.cd(sl, level)?;
                         ephemeral.0
                     },
@@ -1298,14 +1319,9 @@ impl Pwd {
     fn canonicalize<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<PathBuf> {
         fn build_from_fs(mut fs: Raw<Dirent>) -> Result<PathBuf> {
             let mut rev = Vec::new();
-            loop {
-                if fs.name.len() == 0 {
-                    break
-                }
-                fs = {
-                    rev.push(fs.name.clone());
-                    fs.parent.expect("a non-root directory should have a parent, only root has no name")
-                }
+            while !fs.name.is_empty() {
+                rev.push(fs.name.clone());
+                fs = fs.parent.expect("a non-root directory should have a parent, only root has no name");
             }
             rev.reverse();
             let mut pb = PathBuf::from("/");
@@ -1329,13 +1345,14 @@ impl Pwd {
             return Err(EACCES());
         }
 
+        let parent = fs;
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 if let DeKind::Symlink(ref sl) = child.kind {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(*child).canonicalize(sl, level);
+                    return Pwd(parent).canonicalize(sl, level);
                 }
                 build_from_fs(*child)
             }
@@ -1344,7 +1361,7 @@ impl Pwd {
 
     }
 
-    // create_dir creates directories, failing is the directory exists and can_exist is false.
+    // create_dir creates directories, failing if the directory exists and can_exist is false.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
         let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         let base = match may_base {
@@ -1366,8 +1383,9 @@ impl Pwd {
         let parent = fs;
         match fs.kind.dir_mut().entry(base.clone()) {
             Entry::Occupied(o) => {
-                if can_exist && o.get().is_dir() {
-                    return Ok(());
+                // Symlinks are not followed for create_dir_all.
+                if o.get().inode.view().ftyp.is_dir() && can_exist {
+                    return Ok(())
                 }
                 Err(EEXIST())
             }
@@ -1470,16 +1488,17 @@ impl Pwd {
             return Err(EEXIST());
         }
 
-        let base_len = dst_base.len();
+        let sl = src.as_ref().to_owned();
+        let len = sl.as_os_str().len();
         let parent = dst_fs;
         dst_fs.kind
               .dir_mut()
               .insert(dst_base.clone(),
                       Raw::from(Dirent {
                           parent: Some(parent),
-                          kind:   DeKind::Symlink(src.as_ref().to_owned()),
+                          kind:   DeKind::Symlink(sl),
                           name:   dst_base,
-                          inode:  Inode::new(0o777, Ftyp::Symlink, base_len),
+                          inode:  Inode::new(0o777, Ftyp::Symlink, len),
                       }));
         Ok(())
     }
@@ -1511,6 +1530,7 @@ impl Pwd {
             return Err(EACCES());
         }
 
+        let parent = fs;
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 let meta = child.inode.view();
@@ -1518,7 +1538,7 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(*child).metadata(child.kind.symlink_ref(), level);
+                    return Pwd(parent).metadata(child.kind.symlink_ref(), level);
                 }
                 Ok(Metadata(meta))
             }
@@ -1526,17 +1546,19 @@ impl Pwd {
         }
     }
 
-    // read_dir implements, essentially, `ls`, traversing symlinks as necessary.
+    // read_dir implements, essentially, `ls`, traversing symlinks as necessary. We take the
+    // orignial path that we called read_dir on; read_dir traverses symlinks based off the current
+    // path, but returned DirEntry's are based off the original path.
     //
     // This function takes a recursion level as it may be recursive if the end of path is a symlink.
-    fn read_dir<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<ReadDir> {
+    fn read_dir<P: AsRef<Path>, Q: AsRef<Path>>(&self, og_path: Q, path: P, level: &mut u8) -> Result<ReadDir> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
             None => if path_empty(&path) {
                 return Err(ENOENT());
             } else { // path resolved to root or parent paths
-                return ReadDir::new(&path, &*fs);
+                return ReadDir::new(&og_path, &*fs);
             }
         };
 
@@ -1544,6 +1566,7 @@ impl Pwd {
             return Err(EACCES());
         }
 
+        let parent = fs;
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 // If the base of the path is a symlink, we ReadDir that.
@@ -1551,10 +1574,10 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(*child).read_dir(sl, level);
+                    return Pwd(parent).read_dir(og_path, sl, level);
                 }
                 // Otherwise we ReadDir whatever this is - ReadDir::new handles ENOTDIR.
-                ReadDir::new(&path, &*child)
+                ReadDir::new(&og_path, &*child)
             },
             None => Err(ENOENT()),
         }
@@ -1657,7 +1680,7 @@ impl Pwd {
                     for &(child_name, child) in &child_names {
                         match recursive_remove(*child) {
                             Ok(_) => deleted.push(child_name.clone()),
-                            Err(e) => err = Err(e),
+                            Err(e) => { err = Err(e); break; },
                         }
                     }
                     err
@@ -1775,7 +1798,6 @@ impl Pwd {
         renamed.name = new_base.clone();
         let mut inode = renamed.inode.write();
         inode.times.update(MODIFIED|ACCESSED|CREATED);
-        inode.length = new_base.len();
         new_fs.kind.dir_mut().insert(new_base, renamed);
         Ok(())
     }
@@ -1799,6 +1821,7 @@ impl Pwd {
         if !fs.executable() {
             return Err(EACCES());
         }
+        let parent = fs;
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
                 // set_permissions on symlinks changes what they link to, so we recurse.
@@ -1806,7 +1829,7 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(*child).set_permissions(sl, perms, level);
+                    return Pwd(parent).set_permissions(sl, perms, level);
                 }
                 let mut child = *child; // copy out of the borrow
                 child.inode.write().perms = perms;
@@ -1880,12 +1903,13 @@ impl Pwd {
             return Err(EACCES());
         }
         // If the file exists, open it.
+        let parent = fs;
         if let Some(child) = fs.kind.dir_ref().get(&base) {
             if let DeKind::Symlink(ref sl) = child.kind {
                 if {*level += 1; *level} == 40 {
                     return Err(ELOOP());
                 }
-                return Pwd(*child).open(sl, &options, level);
+                return Pwd(parent).open(sl, &options, level);
             }
             return Self::open_existing(child, &options);
         }
@@ -1983,6 +2007,12 @@ mod test {
     use std::thread;
     use unix_ext::*;
 
+    impl PartialEq for FS {
+        fn eq(&self, other: &Self) -> bool {
+            *self.0.lock() == *other.0.lock()
+        }
+    }
+
     fn errs_eq(l: Error, r: Error) -> bool {
         l.raw_os_error() == r.raw_os_error()
     }
@@ -2013,7 +2043,7 @@ mod test {
                 name:   OsString::from("lolz"),
                 inode:  Inode::new(0o666, Ftyp::Dir, DIRLEN),
             }));
-            let file_inode = Inode::new(0o334, Ftyp::File, 0);
+            let file_inode = Inode::new(0o334, Ftyp::File, 3);
             dir.insert(OsString::from("f"), Raw::from(Dirent {
                 parent: Some(parent),
                 kind:   DeKind::File(Arc::new(RwLock::new(RawFile{
@@ -2027,7 +2057,7 @@ mod test {
                 parent: Some(parent),
                 kind:   DeKind::Symlink(String::from(".././zzz").into()),
                 name:   OsString::from("sl"),
-                inode:  Inode::new(0o777, Ftyp::Symlink, 2),
+                inode:  Inode::new(0o777, Ftyp::Symlink, 8),
             }));
         }
 
@@ -2039,7 +2069,7 @@ mod test {
         assert!(fs.set_permissions("/", Permissions::from_mode(0)).is_ok());
         assert!(fs == exp);
         // TODO this test proves that equality works, but does not prove that inequality is
-        // correct. While I have manually verified it, every piece of the above fs could be changed
+        // correct. While I have verified it, every piece of the above fs could be changed
         // to prove it via a test.
     }
 
@@ -2403,7 +2433,6 @@ mod test {
         assert_eq!(next.path(), PathBuf::from("a/b/f"));
         assert_eq!(next.file_name(), OsString::from("f"));
         let meta = next.metadata().unwrap();
-        println!("{:?}", meta);
         assert!(meta.0 == Inode::new(0, Ftyp::File, 0).view());
         let next = reader.next().unwrap().unwrap();
         assert_eq!(next.path(), PathBuf::from("a/b/z"));
@@ -2464,7 +2493,7 @@ mod test {
     }
 
     #[test]
-    fn test_usage() {
+    fn usage() {
         // This test tests quite a few edge conditions.
         let fs = FS::with_mode(0o300);
         assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
@@ -2499,7 +2528,7 @@ mod test {
     }
 
     #[test]
-    fn test_thread() {
+    fn thread() {
         let fs = FS::with_mode(0o300);
         let (tx, rx) = mpsc::channel();
         {
@@ -2511,5 +2540,174 @@ mod test {
         }
         rx.recv().unwrap();
         assert!(fs.metadata("a/b/c").is_ok());
+    }
+
+    #[test]
+    fn hard_link() {
+        let fs = FS::with_mode(0o300);
+        assert!(fs.new_openopts().mode(0o600).create(true).write(true).open("f").is_ok());
+        assert!(fs.symlink("f", "sl").is_ok());
+
+        assert!(fs.new_dirbuilder().mode(0).create("a").is_ok()); // EACCES
+        assert!(fs.file_create("b").is_ok()); // ENOTDIR
+        assert!(fs.new_dirbuilder().mode(0).create("c").is_ok()); // EACCES
+
+        assert!(fs.create_dir("d").is_ok());
+        assert!(fs.file_create("d/f").is_ok()); // EEXIST
+
+        assert!(fs.new_dirbuilder().mode(0o100).create("e").is_ok()); // EACCES
+
+        assert!(errs_eq(fs.hard_link("a/f", "z").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.hard_link("f", "b/f").unwrap_err(), ENOTDIR()));
+        assert!(errs_eq(fs.hard_link("f", "c/f").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.hard_link("z", "q").unwrap_err(),   ENOENT()));
+        assert!(errs_eq(fs.hard_link("f", "d/f").unwrap_err(), EEXIST()));
+        assert!(errs_eq(fs.hard_link("f", "e/f").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.hard_link("a", "z").unwrap_err(),   EPERM()));
+
+        assert!(fs.hard_link("f", "z").is_ok());
+        assert!(fs.hard_link("sl", "ls").is_ok());
+
+        let mut f = fs.new_openopts().write(true).open("f").unwrap();
+        assert_eq!(f.write(vec![1, 2, 3].as_slice()).unwrap(), 3);
+
+        // While we are here, let's test copy quickly.
+        assert_eq!(fs.copy("f", "cpy").unwrap(), 3);
+        assert_eq!(fs.metadata("cpy").unwrap().permissions().mode(), 0o600);
+        assert_eq!(fs.copy("q", "d").unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(fs.copy("d", "d").unwrap_err().kind(), ErrorKind::InvalidInput);
+
+        let mut z = fs.new_openopts().write(true).append(true).open("z").unwrap(); // through hard link
+        {
+            let cursor = z.cursor.lock();
+            let file = cursor.file.read();
+            assert_eq!(file.data.as_slice(), &[1, 2, 3]);
+        }
+        assert_eq!(z.write(vec![1, 2, 3].as_slice()).unwrap(), 3);
+
+
+        {
+            let f = fs.file_open("ls").unwrap(); // through linked (copied) symlink to f
+            let cursor = f.cursor.lock();
+            let file = cursor.file.read();
+            assert_eq!(file.data.as_slice(), &[1, 2, 3, 1, 2, 3]);
+        }
+
+        {
+            let f = fs.file_open("cpy").unwrap(); // ensure our copied file is still normal
+            let cursor = f.cursor.lock();
+            let file = cursor.file.read();
+            assert_eq!(file.data.as_slice(), &[1, 2, 3]);
+        }
+
+        {
+            let cursor = f.cursor.lock(); // re-check the initial f
+            let file = cursor.file.read();
+            assert_eq!(file.data.as_slice(), &[1, 2, 3, 1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn symlink() {
+        // We proved, in our first test, that creating symlinks works. Let's test everything
+        // through symlinks.
+        let fs = FS::with_mode(0o300);
+        let exp = FS::with_mode(0o300);
+        assert!(fs.symlink("hello", "sl").is_ok());
+        assert!(exp.symlink("hello", "sl").is_ok());
+        assert!(fs.symlink("goodbye", "hello").is_ok());
+        assert!(exp.symlink("goodbye", "hello").is_ok());
+        assert!(fs.symlink("unexec", "u").is_ok());
+        assert!(exp.symlink("unexec", "u").is_ok());
+
+        assert!(fs.create_dir("goodbye").is_ok());
+        assert!(fs.symlink(".././a", "goodbye/sl").is_ok());
+        assert!(fs.create_dir("a").is_ok());
+        assert!(fs.create_dir("sl/sl/b").is_ok());
+        assert!(fs.file_create("sl/sl/f").is_ok());
+        assert!(exp.create_dir_all("a/b").is_ok());
+        assert!(exp.file_create("a/f").is_ok());
+        assert!(exp.create_dir("goodbye").is_ok());
+        assert!(exp.symlink(".././a", "goodbye/sl").is_ok());
+        assert!(fs == exp);
+
+        assert!(fs.new_dirbuilder().mode(0).create("unexec").is_ok());
+        assert!(exp.new_dirbuilder().mode(0).create("unexec").is_ok());
+
+        // Throw in our canonicalize testing.
+        assert_eq!(fs.canonicalize("../././/sl/.//sl/b/../").unwrap(), PathBuf::from("/a"));
+        assert_eq!(fs.canonicalize("../").unwrap(), PathBuf::from("/"));
+        assert!(errs_eq(fs.canonicalize("").unwrap_err(), ENOENT()));
+        assert!(errs_eq(fs.canonicalize("a/d/z").unwrap_err(), ENOENT()));
+        assert!(errs_eq(fs.canonicalize("sl/sl/z").unwrap_err(), ENOENT()));
+        assert!(errs_eq(fs.canonicalize("unexec/z").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.canonicalize("u/z").unwrap_err(), EACCES()));
+
+        assert!(fs.remove_dir_all("sl/sl/b/c").is_ok());
+        assert!(exp.remove_dir_all("a/b/c").is_ok());
+        assert!(fs == exp);
+
+        assert!(fs.remove_dir("sl/sl/b").is_ok());
+        assert!(exp.remove_dir("a/b").is_ok());
+        assert!(fs == exp);
+
+        // Throw in our read_link testing.
+        assert_eq!(fs.read_link("sl").unwrap(), PathBuf::from("hello"));
+        assert_eq!(fs.read_link("sl/sl").unwrap(), PathBuf::from(".././a"));
+        assert!(errs_eq(fs.read_link("").unwrap_err(), ENOENT()));
+        assert!(errs_eq(fs.read_link("..").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.read_link("unexec/a").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.read_link("u/a").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.read_link("goodbye").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.read_link("goodbye/d").unwrap_err(), ENOENT()));
+
+        // Metadata through symlinks...
+        assert_eq!(fs.metadata("sl").unwrap().0, Inode::new(0o777, Ftyp::Dir, DIRLEN).view());
+        assert_eq!(fs.metadata("sl/sl").unwrap().0, Inode::new(0o777, Ftyp::Dir, DIRLEN).view());
+        assert_eq!(fs.metadata("sl/sl/f").unwrap().0, Inode::new(0o666, Ftyp::File, 0).view());
+        assert!(errs_eq(fs.metadata("u/f").unwrap_err(), EACCES()));
+
+        // All of symlink_metadata...
+        assert_eq!(fs.symlink_metadata("sl").unwrap().0, Inode::new(0o777, Ftyp::Symlink, 5).view());
+        assert_eq!(fs.symlink_metadata("sl/sl").unwrap().0, Inode::new(0o777, Ftyp::Symlink, 6).view());
+        assert_eq!(fs.symlink_metadata("..").unwrap().0, Inode::new(0o300, Ftyp::Dir, DIRLEN).view());
+        assert_eq!(fs.symlink_metadata("unexec").unwrap().0, Inode::new(0, Ftyp::Dir, DIRLEN).view());
+        assert_eq!(fs.symlink_metadata("a/f").unwrap().0, Inode::new(0o666, Ftyp::File, 0).view());
+        assert_eq!(fs.symlink_metadata("sl/sl/f").unwrap().0, Inode::new(0o666, Ftyp::File, 0).view());
+        assert!(errs_eq(fs.symlink_metadata("unexec/a").unwrap_err(), EACCES()));
+        assert!(errs_eq(fs.symlink_metadata("q").unwrap_err(), ENOENT()));
+        assert!(errs_eq(fs.symlink_metadata("").unwrap_err(), ENOENT()));
+
+        // Set perms...
+        assert!(fs.set_permissions("sl/sl", Permissions::from_mode(0o700)).is_ok());
+        assert!(exp.set_permissions("a", Permissions::from_mode(0o700)).is_ok());
+        assert!(fs == exp);
+
+        // Read_dir...
+        let mut read = fs.read_dir("sl/sl").unwrap();
+        assert_eq!(read.next().unwrap().unwrap().path(), PathBuf::from("sl/sl/f"));
+        assert!(read.next().is_none());
+
+        // Remove_file (tested via exp fs) and rename (via fs)...
+        assert!(fs.rename("sl/sl", "sl/longsl").is_ok());
+        assert!(exp.remove_file("sl/sl").is_ok());
+        assert!(exp.symlink(".././a", "sl/longsl").is_ok());
+        assert!(fs == exp);
+
+        // ELOOP
+        assert!(fs.symlink("z", "z").is_ok());
+        assert!(errs_eq(fs.cd("z").unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.metadata("z/z").unwrap_err(), ELOOP())); // via traverse
+        assert!(errs_eq(fs.canonicalize("z").unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.metadata("z").unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.metadata("z").unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.read_dir("z").unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.set_permissions("z", Permissions::from_mode(0)).unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.file_open("z").unwrap_err(), ELOOP()));
+
+        assert!(exp.symlink("z", "z").is_ok());
+        assert!(fs == exp);
+
+        // Open is tested in hard_link
     }
 }
