@@ -25,6 +25,9 @@
 //! [`rsfs::rs`]: rs/index.html
 //! [`rsfs::testfs`]: testfs/index.html
 
+#![feature(const_fn)]
+#![feature(nonzero)]
+
 mod fs;
 pub use fs::*;
 
@@ -35,3 +38,5 @@ pub mod disk;
 pub mod mem;
 pub mod errors;
 pub mod path_parts;
+
+mod ptr;
