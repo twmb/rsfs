@@ -161,7 +161,7 @@ impl fs::DirEntry for DirEntry {
 // read from or written to, but the file will not be openable anymore.
 #[derive(Debug)]
 struct RawFile {
-    // data is obviously the backing file data.
+    // data is the backing file data.
     data: Vec<u8>,
     // inode allows us to read and write the most up to date metadata.
     inode: Inode,
@@ -187,7 +187,7 @@ impl RawFile {
     // write_at writes to the RawFile at a given index, zero extending the existing data if
     // necessary.
     fn write_at(&mut self, at: usize, src: &[u8]) -> Result<usize> {
-        if src.len() == 0 {
+        if src.is_empty() {
             return Ok(0)
         }
 
@@ -676,7 +676,7 @@ impl FS {
             inode:  Inode::new(mode, Ftyp::Dir, DIRLEN),
         });
         FS(Arc::new(Mutex::new(FileSystem {
-            root: pwd.clone(),
+            root: pwd,
             pwd:  Pwd(pwd),
         })))
     }
@@ -1078,7 +1078,7 @@ impl Drop for FileSystem {
         while let Some(elem) = todo.pop() {
             let rs = unsafe { Box::from_raw(elem.ptr()) };
             if let DeKind::Dir(ref d) = rs.kind {
-                for (_, child) in d {
+                for child in d.values() {
                     todo.push(*child);
                 }
             }
@@ -1087,7 +1087,7 @@ impl Drop for FileSystem {
 }
 
 fn path_empty<P: AsRef<Path>>(path: P) -> bool {
-    path.as_ref().as_os_str().len() == 0
+    path.as_ref().as_os_str().is_empty()
 }
 
 // We claim that two filesystems are equal if they have the same structure, contents, and modes.
@@ -1419,7 +1419,7 @@ impl Pwd {
             Some(child) => child,
             None => return Err(ENOENT()),
         };
-        if let Some(_) = dst_fs.kind.dir_ref().get(&dst_base) {
+        if dst_fs.kind.dir_ref().get(&dst_base).is_some() {
             return Err(EEXIST());
         }
         if !dst_fs.writable() {
@@ -1637,41 +1637,38 @@ impl Pwd {
         // only write and execute privileges. This code attempts to mimic what Rust will do.
         fn recursive_remove(mut fs: Raw<Dirent>) -> Result<()> {
             let accessible = fs.rremovable();
-            match fs.kind {
-                DeKind::Dir(ref mut children) => {
-                    if !accessible {
-                        return Err(EACCES());
-                    }
-
-                    // We recursively remove until we encounter an error. Only after recursing do
-                    // we remove everything from fs's HashMap that we successfully deleted.
-                    let mut deleted = Vec::new();
-                    let res: Result<()> = {
-                        let mut child_names = Vec::new();
-                        for child in children.iter() {
-                            child_names.push(child);
-                        }
-                        // recursive removes work alphabetically
-                        child_names.sort_by_key(|&(k, _)| k);
-
-                        let mut err = Ok(());
-                        for &(child_name, child) in &child_names {
-                            match recursive_remove(child.clone()) {
-                                Ok(_) => deleted.push(child_name.clone()),
-                                Err(e) => err = Err(e),
-                            }
-                        }
-                        err
-                    };
-                    // We have to actually remove everything we successfully recursively "deleted".
-                    for child_name in deleted {
-                        let removed = children.remove(&child_name)
-                                              .expect("deleted has child_name not in child map");
-                        unsafe { Box::from_raw(removed.ptr()); } // free the memory
-                    }
-                    res?
+            if let DeKind::Dir(ref mut children) = fs.kind { // symlinks & files are simply removed
+                if !accessible {
+                    return Err(EACCES());
                 }
-                _ => (), // symlinks and files are simply removed
+
+                // We recursively remove until we encounter an error. Only after recursing do
+                // we remove everything from fs's HashMap that we successfully deleted.
+                let mut deleted = Vec::new();
+                let res: Result<()> = {
+                    let mut child_names = Vec::new();
+                    for child in children.iter() {
+                        child_names.push(child);
+                    }
+                    // recursive removes work alphabetically
+                    child_names.sort_by_key(|&(k, _)| k);
+
+                    let mut err = Ok(());
+                    for &(child_name, child) in &child_names {
+                        match recursive_remove(*child) {
+                            Ok(_) => deleted.push(child_name.clone()),
+                            Err(e) => err = Err(e),
+                        }
+                    }
+                    err
+                };
+                // We have to actually remove everything we successfully recursively "deleted".
+                for child_name in deleted {
+                    let removed = children.remove(&child_name)
+                                          .expect("deleted has child_name not in child map");
+                    unsafe { Box::from_raw(removed.ptr()); } // free the memory
+                }
+                res?
             }
             Ok(())
         }
@@ -1704,7 +1701,7 @@ impl Pwd {
         let old_base = old_may_base.ok_or_else(||
             if path_empty(&from) {
                 ENOENT()
-            } else if let Some(_) = old_fs.parent {
+            } else if old_fs.parent.is_some() {
                 EBUSY() // renaming through parent directories returns EBUSY
             } else {
                 // I really don't want to support this, nor manually test what can happen.
@@ -1714,7 +1711,7 @@ impl Pwd {
         let new_base = new_may_base.ok_or_else(||
             if path_empty(&to) {
                 ENOENT()
-            } else if let Some(_) = new_fs.parent {
+            } else if new_fs.parent.is_some() {
                 EBUSY()
             } else {
                 EEXIST()

@@ -6,10 +6,10 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
-/// Raw is like Unique, but even more unsafe. This is specifically meant to be an unsafe wrapper
-/// around *mut T and should be used extremely carefully. The primary purpose is to make it very
-/// easy to work with *mut T by implementing Deref and DerefMut with their targets being &T and
-/// &mut T.
+/// `Raw` is like `Unique`, but even more unsafe. This is specifically meant to be an unsafe
+/// wrapper around `*mut T` and should be used extremely carefully. The primary purpose is to make
+/// it very easy to work with `*mut T` by implementing `Deref` and `DerefMut` with their targets
+/// being &T and `&mut T`.
 pub struct Raw<T: ?Sized> {
     ptr: NonZero<*const T>,
     mkr: PhantomData<T>,
