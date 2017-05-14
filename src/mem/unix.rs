@@ -65,7 +65,7 @@ use std::collections::hash_map::Entry;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -78,7 +78,6 @@ use errors::*;
 use path_parts::{self, IteratorExt, Part};
 use ptr::Raw;
 
-// TODO File could be tested more, maybe, but the raw_file seems sufficient.
 // How much can be refactored so that Windows support can be easily added?
 
 // DIRLEN is the length returned from Metadata's len() call for a directory. This is pulled from
@@ -663,9 +662,15 @@ pub struct FS(Arc<Mutex<FileSystem>>);
 impl fmt::Display for FS {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let fs = self.0.lock();
-        let root = fs.root;
 
         write!(f, "\nfilesystem\n----------\n")?;
+        if let Alive::No(d) = fs.pwd.0 {
+            if Raw::ptr_eq(&d, &fs.root) {
+                return write!(f, "deleted");
+            }
+        }
+
+        let root = fs.root;
 
         fn wr(f: &mut fmt::Formatter, d: Raw<Dirent>, level: u32) -> fmt::Result {
             for _ in 0..level {
@@ -708,7 +713,7 @@ impl FS {
         });
         FS(Arc::new(Mutex::new(FileSystem {
             root: pwd,
-            pwd:  Pwd(pwd),
+            pwd:  Pwd(Alive::Yes(pwd)),
         })))
     }
 
@@ -740,7 +745,7 @@ impl FS {
     /// assert!(reader.next().is_none());
     /// ```
     pub fn cd<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.0.lock().pwd.cd(path, &mut 0) // the only mutably borrowed pwd
+        self.0.lock().cd(path, &mut 0)
     }
 }
 
@@ -1074,11 +1079,47 @@ impl fmt::Debug for Dirent {
     }
 }
 
+// At a certain point of unsafety, you have to wonder, is it worth it? I ask myself that, now, when
+// finishing the last few TODOs of this library. Although it is getting tedious, I still appreciate
+// the lack of locks and atomics when traversing the filesystem.
+//
+// Recursive removes can actually delete the filesystem from underneath us - we can recursively
+// remove a parent directory. We need to invalidate the filesystem when that happens. That would be
+// easy enough with an Option.
+//
+// However, when the filesystem drops, we need to delete everything under root. This poses problems
+// for if we were to just use an Option: how would we know that we already deleted root?
+//
+// Enter `Alive`. This keeps the dirent pointer around even if it is deleted when recursively
+// removed. Any time we need to use root, we first check if pwd is removed and additionally if the
+// pointer is equal to root. If so, root had already been deleted.
+//
+// Additionally, every Pwd function needs to check if it is alive. This is easy enough: every Pwd
+// function calls up_path, so we can bail early there.
+#[derive(Debug)]
+enum Alive {
+    Yes(Raw<Dirent>),
+    No(Raw<Dirent>),
+}
+
+impl Alive {
+    // get is our convenience function we use in up_path to bail early if our pwd had been deleted
+    // under us.
+    fn get(&self) -> Result<Raw<Dirent>> {
+        match *self {
+            Alive::Yes(d) => Ok(d),
+            Alive::No(_) => Err(EINVAL()),
+        }
+    }
+}
+
 // Pwd is the basis for traversing and modifying our filesystem. We separate it from FileSystem
 // because we may create ephemeral Pwd's on the fly, and we don't want them to Drop and invalidate
 // our entire filesystem.
+//
+// It contains an option because we support removing directories underneath us.
 #[derive(Debug)]
-struct Pwd(Raw<Dirent>);
+struct Pwd(Alive);
 
 // FileSystem is a single in-memory filesystem that can be cloned and passed around safely. A
 // single FileSystem must be unique. It cannot be cloned. On drop, the entire filesystem is
@@ -1097,8 +1138,21 @@ impl Deref for FileSystem {
     }
 }
 
+impl DerefMut for FileSystem {
+    fn deref_mut(&mut self) -> &mut Pwd {
+        &mut self.pwd
+    }
+}
+
 impl Drop for FileSystem {
     fn drop(&mut self) {
+        if let Alive::No(raw_ptr) = self.pwd.0 {
+            if Raw::ptr_eq(&self.root, &raw_ptr) {
+                // It appears we have dropped everything already.
+                return;
+            }
+        }
+
         let mut todo = Vec::new();
         todo.push(self.root);
         while let Some(elem) = todo.pop() {
@@ -1158,8 +1212,11 @@ impl Pwd {
     fn up_path(&self,
                parts: path_parts::Parts)
                -> Result<(Raw<Dirent>, path_parts::Parts)> {
+        // up_path is the point of entry for every function in pwd. Conveniently, this also means
+        // this is the only location we need to check if our filesystem has been removed from under
+        // us via a remove_dir_all.
+        let mut up = self.0.get()?;
         // If (normalized) parts begins at root, there are no ParentDirs.
-        let mut up = self.0;
         if parts.at_root() {
             while let Some(parent) = up.parent {
                 up = parent;
@@ -1233,7 +1290,7 @@ impl Pwd {
                     // with parts_iter. We traverse a symlink _from_ its parent, and we must set
                     // fs to the traversed fs when it is done.
                     fs = fs.parent.expect("symlinks should always have a parent");
-                    let (new_fs, may_base) = Pwd(fs).traverse(path_parts::normalize(sl), level)?;
+                    let (new_fs, may_base) = Pwd(Alive::Yes(fs)).traverse(path_parts::normalize(sl), level)?;
                     fs = new_fs;
                     match may_base {
                         Some(base) => {
@@ -1283,7 +1340,7 @@ impl Pwd {
             None => if path_empty(&path) {
                 return Ok(());
             } else { // the path resulted in root or parent directories only
-                self.0 = fs;
+                self.0 = Alive::Yes(fs);
                 return Ok(());
             }
         };
@@ -1299,11 +1356,11 @@ impl Pwd {
                         if {*level += 1; *level} == 40 {
                             return Err(ELOOP());
                         }
-                        let mut ephemeral = Pwd(parent);
+                        let mut ephemeral = Pwd(Alive::Yes(parent));
                         ephemeral.cd(sl, level)?;
                         ephemeral.0
                     },
-                    _ => *child,
+                    _ => Alive::Yes(*child),
                 };
                 Ok(())
             }
@@ -1352,7 +1409,7 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(parent).canonicalize(sl, level);
+                    return Pwd(Alive::Yes(parent)).canonicalize(sl, level);
                 }
                 build_from_fs(*child)
             }
@@ -1538,7 +1595,7 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(parent).metadata(child.kind.symlink_ref(), level);
+                    return Pwd(Alive::Yes(parent)).metadata(child.kind.symlink_ref(), level);
                 }
                 Ok(Metadata(meta))
             }
@@ -1574,7 +1631,7 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(parent).read_dir(og_path, sl, level);
+                    return Pwd(Alive::Yes(parent)).read_dir(og_path, sl, level);
                 }
                 // Otherwise we ReadDir whatever this is - ReadDir::new handles ENOTDIR.
                 ReadDir::new(&og_path, &*child)
@@ -1644,6 +1701,7 @@ impl Pwd {
                         .dir_mut()
                         .remove(&base)
                         .expect("remove logic checking existence is wrong");
+        // We cannot remove a directory underneath pwd, so we are fine.
         unsafe { Box::from_raw(removed.ptr()); }
         Ok(())
     }
@@ -1654,11 +1712,24 @@ impl Pwd {
         self.remove(path, FileType(Ftyp::Dir))
     }
 
-    fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    fn remove_dir_all<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        // Unfortunately, with remove_dir _all, we can actually remove the dirent we are on. This
+        // is valid. We need to support it. But, because I'm doing things unsafely, we have to be
+        // careful to not use free memory after this is over.
+        //
+        // We will do this by comparing every deleted dirent to our pwd, and, if one is our pwd, we
+        // will invalidate ourself.
+        fn maybe_kill_self(pwd: &mut Pwd, removed: &Raw<Dirent>) {
+            if let Alive::Yes(raw_pwd) = pwd.0 {
+                if Raw::ptr_eq(&removed, &raw_pwd) {
+                    pwd.0 = Alive::No(raw_pwd);
+                }
+            }
+        }
         // Rust's remove_dir_all is actually very weak (weaker than rm -r). Rust relies on read_dir
         // to recurse, which requires `ls`. Standard linux is able to remove empty directories with
         // only write and execute privileges. This code attempts to mimic what Rust will do.
-        fn recursive_remove(mut fs: Raw<Dirent>) -> Result<()> {
+        fn recursive_remove(pwd: &mut Pwd, mut fs: Raw<Dirent>) -> Result<()> {
             let accessible = fs.rremovable();
             if let DeKind::Dir(ref mut children) = fs.kind { // symlinks & files are simply removed
                 if !accessible {
@@ -1678,7 +1749,7 @@ impl Pwd {
 
                     let mut err = Ok(());
                     for &(child_name, child) in &child_names {
-                        match recursive_remove(*child) {
+                        match recursive_remove(pwd, *child) {
                             Ok(_) => deleted.push(child_name.clone()),
                             Err(e) => { err = Err(e); break; },
                         }
@@ -1689,12 +1760,14 @@ impl Pwd {
                 for child_name in deleted {
                     let removed = children.remove(&child_name)
                                           .expect("deleted has child_name not in child map");
+                    maybe_kill_self(pwd, &removed);
                     unsafe { Box::from_raw(removed.ptr()); } // free the memory
                 }
                 res?
             }
             Ok(())
         }
+
 
         let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         match may_base {
@@ -1703,7 +1776,8 @@ impl Pwd {
                     return Err(EACCES());
                 }
                 if let Entry::Occupied(child) = fs.kind.dir_mut().entry(base) {
-                    recursive_remove(*child.get())?;
+                    recursive_remove(self, *child.get())?;
+                    maybe_kill_self(self, child.get());
                     unsafe { Box::from_raw(child.remove().ptr()); }
                 }
             }
@@ -1711,9 +1785,9 @@ impl Pwd {
                 if path_empty(&path) {
                     return Err(ENOENT());
                 }
-                // TODO we can remove the fs under us. This is valid, but future IO operations
-                // should completely fail unless we are at root and root is what remains.
-                recursive_remove(fs)?;
+                recursive_remove(self, fs)?;
+                maybe_kill_self(self, &fs);
+                unsafe { Box::from_raw(fs.ptr()); }
             }
         }
         Ok(())
@@ -1829,7 +1903,7 @@ impl Pwd {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return Pwd(parent).set_permissions(sl, perms, level);
+                    return Pwd(Alive::Yes(parent)).set_permissions(sl, perms, level);
                 }
                 let mut child = *child; // copy out of the borrow
                 child.inode.write().perms = perms;
@@ -1909,7 +1983,7 @@ impl Pwd {
                 if {*level += 1; *level} == 40 {
                     return Err(ELOOP());
                 }
-                return Pwd(parent).open(sl, &options, level);
+                return Pwd(Alive::Yes(parent)).open(sl, &options, level);
             }
             return Self::open_existing(child, &options);
         }
@@ -2032,7 +2106,7 @@ mod test {
 
         let exp = FS(Arc::new(Mutex::new(FileSystem {
                 root: exp_root,
-                pwd:  Pwd(exp_root),
+                pwd:  Pwd(Alive::Yes(exp_root)),
             })));
         {
             let parent = exp_root;
@@ -2085,7 +2159,7 @@ mod test {
         });
         let exp = FS(Arc::new(Mutex::new(FileSystem {
                 root: exp_root,
-                pwd:  Pwd(exp_root),
+                pwd:  Pwd(Alive::Yes(exp_root)),
             })));
 
         {
@@ -2366,6 +2440,28 @@ mod test {
         let exp = FS::with_mode(0o700);
         assert!(exp.new_dirbuilder().mode(0o500).create("x").is_ok());
         assert!(fs == exp);
+
+        let fs = FS::new();
+        assert!(fs.remove_dir_all(".").is_ok());
+        assert!(errs_eq(fs.canonicalize("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.copy("a", "b").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.create_dir("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.create_dir_all("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.hard_link("a", "b").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.metadata("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.read_dir("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.read_link("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.remove_dir("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.remove_dir_all("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.remove_file("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.rename("a", "b").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.set_permissions("a", Permissions::from_mode(0)).unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.symlink_metadata("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.symlink("a", "b").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.file_open("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.file_create("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.new_openopts().write(true).create(true).open("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.new_dirbuilder().create("a").unwrap_err(), EINVAL()));
     }
 
     #[test]
