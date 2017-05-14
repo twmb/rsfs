@@ -63,33 +63,38 @@ use std::cmp::{self, Ordering};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{self, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::time::SystemTime;
 use std::vec::IntoIter;
 
 use fs::{self, DirBuilder as _DirBuilder, FileType as _FileType, Metadata as _Metadata};
-use unix_ext::{self, PermissionsExt as _PermissionsExt};
+use unix_ext;
 
 use errors::*;
 use path_parts::{self, IteratorExt, Part};
+use ptr::Raw;
 
 // TODO File could be tested more, maybe, but the raw_file seems sufficient.
 // Permissions and FileType can be tested directly - right now they are tested indirectly.
+// How much can be refactored so that Windows support can be easily added?
 
 // DIRLEN is the length returned from Metadata's len() call for a directory. This is pulled from
 // the initial file size that Unix uses for a directory sector. This module does not attempt to
 // return a larger number if the directory contains many children with long names.
-const DIRLEN: u64 = 4096;
-const SYMLEN: u64 = 1;
+const DIRLEN: usize = 4096;
 
 /// A builder used to create directories in various manners.
 ///
 /// See the module [documentation] for a comprehensive example.
 ///
 /// [documentation]: index.html
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DirBuilder {
+    // fs is what we reach inside to create our directory.
     fs: FS,
 
     recursive: bool,
@@ -102,9 +107,9 @@ impl fs::DirBuilder for DirBuilder {
     }
     fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         if self.recursive {
-            self.fs.inner.lock().create_dir_all(path, self.mode)
+            self.fs.0.lock().create_dir_all(path, self.mode)
         } else {
-            self.fs.inner.lock().create_dir(path, self.mode, false)
+            self.fs.0.lock().create_dir(path, self.mode, false)
         }
     }
 }
@@ -121,11 +126,16 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 ///
 /// [`ReadDir`]: struct.ReadDir.html
 /// [documentation]: index.html
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct DirEntry {
-    dir:  PathBuf,
+    // dir is the original path requested for ReadDir. We make no attempt to clean it.
+    dir: PathBuf,
+    // base is the name of the file/dir/symlink at this dirent. This is created when making a
+    // DirEntry, meaning we do not track if the dirent was renamed immediately after creation.
     base: OsString,
-    meta: Metadata,
+    // inode is the backing "inode" for this DirEntry. The metadata() and file_type() functions in
+    // std::fs actually do OS calls, meaning they work on the most up to date actual entry.
+    inode: Inode,
 }
 
 impl fs::DirEntry for DirEntry {
@@ -136,31 +146,31 @@ impl fs::DirEntry for DirEntry {
         self.dir.join(self.base.clone())
     }
     fn metadata(&self) -> Result<Self::Metadata> {
-        Ok(self.meta)
+        Ok(Metadata(*self.inode.read()))
     }
     fn file_type(&self) -> Result<Self::FileType> {
-        Ok(self.meta.file_type())
+        Ok(self.inode.read().ftyp)
     }
     fn file_name(&self) -> OsString {
         self.base.clone()
     }
 }
 
-// `RawFile` is the underling contents of a file in our filesystem. `OpenOption`s `.open()` call
-// returns a view of a file. If a file is removed from the filesystem, it is invalidated and all
-// `File` views will fail (most) future operations.
+// RawFile is the underling contents of a file in our filesystem. OpenOption's .open() call returns
+// a view of a file. If a file is removed from the filesystem, currently open files can still be
+// read from or written to, but the file will not be openable anymore.
 #[derive(Debug)]
 struct RawFile {
-    valid: bool,
-    data:  Vec<u8>,
+    // data is obviously the backing file data.
+    data: Vec<u8>,
+    // inode allows us to read and write the most up to date metadata.
+    inode: Inode,
 }
 
 impl RawFile {
-    // read_at reads contents of the file into dst from a given existing index in the file.
+    // read_at reads contents of the file into dst from a given index in the file.
     fn read_at(&self, at: usize, dst: &mut [u8]) -> Result<usize> {
-        if !self.valid {
-            return Err(ENOENT());
-        }
+        self.inode.write().times.update(ACCESSED);
 
         let data = &self.data;
         if at > data.len() {
@@ -174,33 +184,31 @@ impl RawFile {
         Ok(copy_size)
     }
 
-    // write_at writes to the RawFile at a given index.
+    // write_at writes to the RawFile at a given index, zero extending the existing data if
+    // necessary.
     fn write_at(&mut self, at: usize, src: &[u8]) -> Result<usize> {
-        if !self.valid {
-            return Err(ENOENT());
+        if src.len() == 0 {
+            return Ok(0)
         }
 
         let mut dst = &mut self.data;
-
         if at > dst.len() {
-            let new = vec![0; at + src.len()];
+            let mut new = vec![0; at + src.len()];
+            new[..dst.len()].copy_from_slice(dst);
             *dst = new;
         }
 
         let new_end = src.len() + at;
-
         if dst.len() >= new_end {
             dst[at..new_end].copy_from_slice(src);
         } else {
             dst.truncate(at);
             dst.extend_from_slice(src);
         }
+        let mut inode = self.inode.write();
+        inode.times.update(MODIFIED);
+        inode.length = dst.len();
         Ok(src.len())
-    }
-
-    // invalidate ensures that all future operations on files will fail with ENOENT.
-    fn invalidate(&mut self) {
-        self.valid = false
     }
 }
 
@@ -213,19 +221,71 @@ impl RawFile {
 /// See the module [documentation] for a comprehensive example.
 ///
 /// [documentation]: index.html
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct File {
-    // fields that allow us to set_permissions...
-    fs:   FS,
-    path: PathBuf,
-
     read:   bool,
     write:  bool,
     append: bool,
 
-    metadata: Metadata,
-
+    // cursor is wrapped in an Arc<Mutex<_>> solely to support File's probably-should-never-be-used
+    // try_clone function.
     cursor: Arc<Mutex<FileCursor>>,
+}
+
+impl fs::File for File {
+    type Metadata    = Metadata;
+    type Permissions = Permissions;
+
+    fn sync_all(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_len(&self, size: u64) -> Result<()> {
+        if !self.write {
+            return Err(EINVAL());
+        }
+        Ok(self.cursor.lock().set_len(size)?)
+    }
+
+    fn metadata(&self) -> Result<Self::Metadata> {
+        // We sure do lock a lot. We're going down three locks here!
+        //
+        // File's _likely_ useless try_clone forces the first lock, as there may potentially be two
+        // File's with the same cursor.
+        //
+        // A cursor needs a read/write lock as there could be non-cloned File's that use the same
+        // RawFile.
+        //
+        // A RawFile needs a read/write lock to reach into the "inode" to copy perms and times.
+        //
+        // It isn't elegant, but it works and is easy.
+        let cursor = self.cursor.lock();
+        let file = cursor.file.read();
+        let meta = Metadata(*file.inode.read());
+		Ok(meta)
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(File {
+            read:   self.read,
+            write:  self.write,
+            append: self.append,
+            cursor: self.cursor.clone(),
+        })
+    }
+
+    fn set_permissions(&self, perms: Self::Permissions) -> Result<()> {
+        let cursor = self.cursor.lock();
+        let file = cursor.file.write();
+        let mut inode = file.inode.write();
+
+        inode.perms = perms;
+        Ok(())
+    }
 }
 
 // FileCursor corresponds to an actual file descriptor, which, "behind the scenes", keeps track of
@@ -236,48 +296,23 @@ struct FileCursor {
     at:   usize,
 }
 
-impl fs::File for File {
-    type Metadata    = Metadata;
-    type Permissions = Permissions;
-
-    fn sync_all(&self) -> Result<()> {
-        Ok(())
-    }
-    fn sync_data(&self) -> Result<()> {
-        Ok(())
-    }
-    fn set_len(&self, size: u64) -> Result<()> {
-        if !self.write {
-            return Err(EINVAL());
-        }
-        Ok(self.cursor.lock().set_len(size)?)
-    }
-    fn metadata(&self) -> Result<Self::Metadata> {
-        Ok(self.metadata)
-    }
-    fn try_clone(&self) -> Result<Self> {
-        Ok(self.clone())
-    }
-    fn set_permissions(&self, perm: Self::Permissions) -> Result<()> {
-        use fs::GenFS;
-        Ok(self.fs.set_permissions(&self.path, perm)?)
-    }
-}
-
 impl FileCursor {
     fn set_len(&mut self, size: u64) -> Result<()> {
         let mut file = self.file.write();
+        file.inode.write().times.update(MODIFIED);
+
         let size = size as usize;
         match file.data.len().cmp(&size) {
             Ordering::Less => {
                 // If data is smaller, create a longer Vec and copy the original contents over.
+                // This borrows from RawFile's write_at.
                 let mut new = vec![0; size];
                 new[..file.data.len()].copy_from_slice(&file.data);
                 file.data = new;
             }
             // If data is longer, simply truncate it.
             Ordering::Greater => file.data.truncate(size),
-            // Truncate to the length data is? Do nothing!
+            // set_len to the length data is? Do nothing!
             _ => (),
         }
         Ok(())
@@ -301,6 +336,8 @@ impl FileCursor {
 
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let file = self.file.write();
+        file.inode.write().times.update(ACCESSED);
+
         let len = file.data.len();
         // seek seemingly returns (if successful) the sum of the position we are seeking from and
         // the offset. This is the case even if we seek past the end of the file.
@@ -357,7 +394,7 @@ impl Seek for File {
     }
 }
 
-// now we duplicate our impls for a &'a File - this is necessary because we can call mutable
+// Now we duplicate our impls for a &'a File - this is necessary because we can call mutable
 // functions (read, write, flush, seek) on a file reference.
 
 impl<'a> Read for &'a File {
@@ -408,7 +445,7 @@ impl unix_ext::FileExt for File {
 }
 
 // Ftyp is the actual underlying enum for a FileType.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum Ftyp {
     File,
     Dir,
@@ -416,7 +453,7 @@ enum Ftyp {
 }
 
 /// Represents the type of a file.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FileType(Ftyp);
 
 impl fs::FileType for FileType {
@@ -436,31 +473,27 @@ impl fs::FileType for FileType {
 /// See the module [documentation] for a comprehensive example.
 ///
 /// [documentation]: index.html
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Metadata {
-    filetype: FileType,
-    length:   u64,
-    perms:    Permissions,
-}
+#[derive(Clone, Debug)]
+pub struct Metadata(InodeData); // Metadata is a copy of InodeData at a point in time.
 
 impl fs::Metadata for Metadata {
     type Permissions = Permissions;
     type FileType    = FileType;
 
     fn file_type(&self) -> Self::FileType {
-        self.filetype
+        self.0.ftyp
     }
     fn is_dir(&self) -> bool {
-        self.filetype.is_dir()
+        self.0.ftyp.is_dir()
     }
     fn is_file(&self) -> bool {
-        self.filetype.is_file()
+        self.0.ftyp.is_file()
     }
     fn len(&self) -> u64 {
-        self.length
+        self.0.length as u64
     }
     fn permissions(&self) -> Self::Permissions {
-        self.perms
+        self.0.perms
     }
 }
 
@@ -503,7 +536,7 @@ impl fs::OpenOptions for OpenOptions {
         self.excl = create_new; self
     }
     fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
-        self.fs.inner.lock().open(self.fs.clone(), path, self, &mut 0)
+        self.fs.0.lock().open(path, self, &mut 0)
     }
 }
 
@@ -512,8 +545,39 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
         self.mode = mode; self
     }
     fn custom_flags(&mut self, _: i32) -> &mut Self {
-        // we do nothing with these flags yet
+        // we do nothing with these flags yet; they're mostly useful for when getting a File from a
+        // raw file descriptor that is a socket or something non-filey.
         self
+    }
+}
+
+/// Representation of the various permissions on a file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Permissions(u32);
+
+impl fs::Permissions for Permissions {
+	// readonly and set_readonly are odd: https://github.com/rust-lang/rust/issues/41984
+    fn readonly(&self) -> bool {
+        self.0 & 0o222 == 0
+    }
+    fn set_readonly(&mut self, readonly: bool) {
+        if readonly {
+            self.0 &= !0o222
+        } else {
+            self.0 |= 0o222
+        }
+    }
+}
+
+impl unix_ext::PermissionsExt for Permissions {
+    fn mode(&self) -> u32 {
+        self.0
+    }
+    fn set_mode(&mut self, mode: u32) {
+        self.0 = mode
+    }
+    fn from_mode(mode: u32) -> Self {
+        Permissions(mode)
     }
 }
 
@@ -536,37 +600,23 @@ impl ReadDir {
         if !dir.readable() {
             return Err(EACCES());
         }
-        let children = {
-            match dir.kind {
-                DeKind::Dir(ref children) => children,
-                _ => return Err(ENOTDIR()),
-            }
+        let children = match dir.kind {
+            DeKind::Dir(ref children) => children,
+            _ => return Err(ENOTDIR()),
         };
 
-        // iterate over the children and create a bunch of DirEntrys as appropriate.
+        // Most linux systems actually dont update atime on every read because that'd be pretty
+        // expensive (note "relatime" when checking the output of `mount`). We do because it is
+        // cheaper to update an in-memory timestamp.
+        dir.inode.write().times.update(ACCESSED);
+
+        // Iterate over the children and create a bunch of DirEntrys as appropriate.
         let mut dirents = Vec::new();
         for (base, dirent) in children.iter() {
-            let dirent = dirent.read();
             dirents.push(DirEntry {
-                dir:  PathBuf::from(path.as_ref()),
-                base: base.clone(),
-                meta: match dirent.kind {
-                    DeKind::Dir(_) => Metadata {
-                        filetype: FileType(Ftyp::Dir),
-                        length:   DIRLEN,
-                        perms:    Permissions::from_mode(dirent.mode),
-                    },
-                    DeKind::File(ref f) => Metadata {
-                        filetype: FileType(Ftyp::File),
-                        length:   f.read().data.len() as u64,
-                        perms:    Permissions::from_mode(dirent.mode),
-                    },
-                    DeKind::Symlink(_) => Metadata {
-                        filetype: FileType(Ftyp::Symlink),
-                        length:   SYMLEN,
-                        perms:    Permissions::from_mode(dirent.mode),
-                    },
-                },
+                dir:   PathBuf::from(path.as_ref()),
+                base:  base.clone(),
+                inode: dirent.inode.clone(),
             });
         }
         // read_dir on every system I have ever used returns dirents in alphabetical order, so we
@@ -587,37 +637,6 @@ impl Iterator for ReadDir {
     }
 }
 
-/// Representation of the various permissions on a file.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Permissions {
-    mode: u32,
-}
-
-impl fs::Permissions for Permissions {
-    fn readonly(&self) -> bool {
-        self.mode & 0o400 != 0
-    }
-    fn set_readonly(&mut self, readonly: bool) {
-        if readonly {
-            self.mode |= 0o400
-        } else {
-            self.mode &= !0o400
-        }
-    }
-}
-
-impl unix_ext::PermissionsExt for Permissions {
-    fn mode(&self) -> u32 {
-        self.mode
-    }
-    fn set_mode(&mut self, mode: u32) {
-        self.mode = mode
-    }
-    fn from_mode(mode: u32) -> Self {
-        Permissions { mode: mode }
-    }
-}
-
 /// An in memory struct that satisfies [`rsfs::FS`].
 ///
 /// `FS` is thread safe and copyable. It operates internally with an `Arc<Mutex<FileSystem>>`
@@ -631,9 +650,7 @@ impl unix_ext::PermissionsExt for Permissions {
 /// [`rsfs::FS`]: ../trait.FS.html
 /// [documentation]: index.html
 #[derive(Clone, Debug)]
-pub struct FS {
-    inner: Arc<Mutex<FileSystem>>,
-}
+pub struct FS(Arc<Mutex<FileSystem>>);
 
 impl FS {
     /// Creates an empty `FS` with mode `0o777`.
@@ -643,18 +660,16 @@ impl FS {
 
     /// Creates an empty `FS` with the given mode.
     pub fn with_mode(mode: u32) -> FS {
-        let pwd = Arc::new(RwLock::new(Dirent {
-            parent: Weak::new(),
+        let pwd = Raw::from(Dirent {
+            parent: None,
             kind:   DeKind::Dir(HashMap::new()),
-            mode:   mode,
             name:   OsString::from(""),
-        }));
-        FS {
-            inner: Arc::new(Mutex::new(FileSystem {
-                root: pwd.clone(),
-                pwd:  pwd,
-            })),
-        }
+            inode:  Inode::new(mode, Ftyp::Dir, DIRLEN),
+        });
+        FS(Arc::new(Mutex::new(FileSystem {
+            root: pwd.clone(),
+            pwd:  Pwd(pwd),
+        })))
     }
 
     /// Changes the current working directory of the filesystem.
@@ -685,7 +700,7 @@ impl FS {
     /// assert!(reader.next().is_none());
     /// ```
     pub fn cd<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.inner.lock().cd(path, &mut 0)
+        self.0.lock().pwd.cd(path, &mut 0) // the only mutably borrowed pwd
     }
 }
 
@@ -696,8 +711,8 @@ impl Default for FS {
 }
 
 impl PartialEq for FS {
-    fn eq(&self, other: &FS) -> bool {
-        *self.inner.lock() == *other.inner.lock()
+    fn eq(&self, other: &Self) -> bool {
+        *self.0.lock() == *other.0.lock()
     }
 }
 
@@ -711,7 +726,7 @@ impl fs::GenFS for FS {
     type ReadDir     = ReadDir;
 
     fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        self.inner.lock().canonicalize(path, &mut 0)
+        self.0.lock().canonicalize(path, &mut 0)
     }
     fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
         // std::fs's copy actually uses std::fs functions to implement copy, which is nice. We will
@@ -726,16 +741,15 @@ impl fs::GenFS for FS {
         // Now we do our "is file" checking, scoping the lock, because most other functions below
         // this scope each use a lock.
         {
-            let fs = self.inner.lock();
+            let fs = &*self.0.lock();
             let (fs, may_base) = fs.traverse(path_parts::normalize(&from), &mut 0)?;
             let base = may_base.ok_or_else(not_file)?;
 
-            let fs = fs.read();
             if !fs.executable() {
                 return Err(EACCES());
             }
             if let Some(child) = fs.kind.dir_ref().get(&base) {
-                match child.read().kind {
+                match child.kind {
                     DeKind::File(_) => (),
                     _ => return Err(not_file())
                 }
@@ -747,6 +761,7 @@ impl fs::GenFS for FS {
         // be the only potential problem. The end result would be that the symlink's target is
         // copied, which really isn't a huge deal. If the race changed from to a directory, the
         // io::copy would fail, as reads on directories fail immediately.
+        // (also see https://github.com/rust-lang/rust/issues/37885)
         use fs::OpenOptions;
         let mut reader = self.new_openopts().read(true).open(from)?;
         let mut writer = self.new_openopts().write(true).truncate(true).create(true).open(from)?;
@@ -763,34 +778,34 @@ impl fs::GenFS for FS {
         self.new_dirbuilder().recursive(true).create(path)
     }
     fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
-        self.inner.lock().hard_link(src, dst)
+        self.0.lock().hard_link(src, dst)
     }
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
-        self.inner.lock().metadata(path, &mut 0)
+        self.0.lock().metadata(path, &mut 0)
     }
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Self::ReadDir> {
-        self.inner.lock().read_dir(path, &mut 0)
+        self.0.lock().read_dir(path, &mut 0)
     }
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        self.inner.lock().read_link(path)
+        self.0.lock().read_link(path)
     }
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.inner.lock().remove_dir(path)
+        self.0.lock().remove_dir(path)
     }
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.inner.lock().remove_dir_all(path)
+        self.0.lock().remove_dir_all(path)
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.inner.lock().remove_file(path)
+        self.0.lock().remove_file(path)
     }
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        self.inner.lock().rename(from, to)
+        self.0.lock().rename(from, to)
     }
-    fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
-        self.inner.lock().set_permissions(path, perm.mode, &mut 0)
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, perms: Self::Permissions) -> Result<()> {
+        self.0.lock().set_permissions(path, perms, &mut 0)
     }
     fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Self::Metadata> {
-        self.inner.lock().symlink_metadata(path)
+        self.0.lock().symlink_metadata(path)
     }
 
     fn new_openopts(&self) -> Self::OpenOptions {
@@ -826,15 +841,108 @@ impl fs::GenFS for FS {
 
 impl unix_ext::FSExt for FS {
     fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
-        self.inner.lock().symlink(src, dst)
+        self.0.lock().symlink(src, dst)
     }
 }
 
-// DeKind differentiates between files, directories, and symlinks.
+// Times tracks the modified, accessed, and created time for a Dirent.
+#[derive(Copy, Clone, Debug)]
+struct Times {
+    modified: SystemTime,
+    accessed: SystemTime,
+    created:  SystemTime,
+}
+
+const MODIFIED: u8 = 1; // modified time
+const ACCESSED: u8 = 2; // accessed time
+const CREATED:  u8 = 4; // created time
+
+impl Times {
+    fn new() -> Times {
+        let now = SystemTime::now();
+        Times {
+            modified: now,
+            accessed: now,
+            created:  now,
+        }
+    }
+
+    fn update(&mut self, fields: u8) {
+        const MASK: u8 = !(MODIFIED | ACCESSED | CREATED);
+        if fields & MASK != 0 {
+            panic!("incorrect times update usage!")
+        }
+        let now = SystemTime::now();
+        if fields & MODIFIED != 0 {
+            self.modified = now;
+        }
+        if fields & ACCESSED != 0 {
+            self.accessed = now;
+        }
+        if fields & CREATED != 0 {
+            self.created = now;
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct InodeData {
+    times:  Times,
+    perms:  Permissions,
+    ftyp:   FileType,
+    length: usize,
+}
+
+impl PartialEq for InodeData {
+    fn eq(&self, other: &Self) -> bool {
+        self.perms == other.perms &&
+            self.ftyp == other.ftyp &&
+            self.length == other.length
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Inode(Arc<RwLock<InodeData>>);
+
+impl PartialEq for Inode {
+    fn eq(&self, other: &Self) -> bool {
+        *self.read() == *other.read()
+    }
+}
+
+impl Inode {
+    fn new(mode: u32, ftyp: Ftyp, len: usize) -> Inode {
+        Inode(Arc::new(RwLock::new(InodeData {
+            times:  Times::new(),
+            perms:  Permissions(mode),
+            ftyp:   FileType(ftyp),
+            length: len,
+        })))
+    }
+
+    fn view(&self) -> InodeData {
+        *self.read()
+    }
+    fn perms(&self) -> Permissions {
+        self.read().perms
+    }
+}
+
+impl Deref for Inode {
+    type Target = Arc<RwLock<InodeData>>;
+
+    #[inline]
+    fn deref(&self) -> &Arc<RwLock<InodeData>> {
+        &self.0
+    }
+}
+
+// DeKind differentiates between files, directories, and symlinks. It mildly duplicates information
+// that is available in InodeData's ftyp.
 #[derive(Debug)]
 enum DeKind {
     File(Arc<RwLock<RawFile>>),
-    Dir(HashMap<OsString, Arc<RwLock<Dirent>>>),
+    Dir(HashMap<OsString, Raw<Dirent>>),
     Symlink(PathBuf),
 }
 
@@ -845,29 +953,51 @@ impl DeKind {
             _ => panic!("file_ref used on DeKind when not a file"),
         }
     }
-    fn dir_ref(&self) -> &HashMap<OsString, Arc<RwLock<Dirent>>> {
+    fn dir_ref(&self) -> &HashMap<OsString, Raw<Dirent>> {
         match *self {
             DeKind::Dir(ref d) => d,
             _ => panic!("dir_ref used on DeKind when not a dir"),
         }
     }
-    fn dir_mut(&mut self) -> &mut HashMap<OsString, Arc<RwLock<Dirent>>> {
+    fn dir_mut(&mut self) -> &mut HashMap<OsString, Raw<Dirent>> {
         match *self {
             DeKind::Dir(ref mut d) => d,
             _ => panic!("dir_mut used on DeKind when not a dir"),
         }
     }
+    fn symlink_ref(&self) -> &PathBuf {
+        match *self {
+            DeKind::Symlink(ref sl) => sl,
+            _ => panic!("symlink_ref used on DeKind when not a symlink"),
+        }
+    }
 }
 
-// Dirent represents all information needed at a node in our filesystem tree.
-#[derive(Debug)]
+// Dirent represents all information needed at a node in our filesystem tree. We use raw pointers
+// to traverse dirents. It's "unsafe", so we have a myriad of tests ensuring it isn't.
+//
+// We use Raw because the real alternative is Arc<RwLock<_>> around every Dirent (inside the
+// HashMap and inside the parent). Doing this would force a clone and a read lock on every
+// directory traversal. After writing all FS operations using Arc/RwLock, I am not so sure that
+// this is even safe. As I finished up the functions below, I began to wonder if it would be
+// possible for some combination of traversals to hold a read lock on a directory I need to modify.
+//
+// More importantly, having two filesystem operations occuring simultaneously is completely unsafe.
+// Think about what would happen if we need to rename something from /a/b/c to /d/e/f at the same
+// time that we are recursively removing /d. We would deadlock.
+//
+// Long story short, after actually writing a million clones and locks, I figured it'd be clearer
+// to convert this to a bunch of unsafe code that is completely hidden away.
+//
+// But it is still unsafe. Don't forget that. Scrutinize my code.
 struct Dirent {
-    parent: Weak<RwLock<Dirent>>,
+    parent: Option<Raw<Dirent>>,
     kind:   DeKind,
-    mode:   u32,
     name:   OsString,
+    inode:  Inode,
 }
 
+// Functions implemented for Dirent basically all are helpers on reading the underlying inode data.
 impl Dirent {
     fn is_dir(&self) -> bool {
         match self.kind {
@@ -876,34 +1006,87 @@ impl Dirent {
         }
     }
     fn readable(&self) -> bool {
-        self.mode & 0o400 > 0
+        self.inode.perms().0 & 0o400 == 0o400
     }
     fn writable(&self) -> bool {
-        self.mode & 0o200 > 0
+        self.inode.perms().0 & 0o200 == 0o200
     }
     fn executable(&self) -> bool {
-        self.mode & 0o100 > 0
+        self.inode.perms().0 & 0o100 == 0o100
+    }
+    // changeable implies executable and writable. Executable is always needed when attempting to
+    // write to a directory.
+    fn changeable(&self) -> bool {
+        self.inode.perms().0 & 0o300 == 0o300
+    }
+    // Only recursive removes need completely open permissions.
+    fn rremovable(&self) -> bool {
+        self.inode.perms().0 & 0o700 == 0o700
     }
 }
 
-// FileSystem is a single in-memory filesystem that can be cloned and passed around safely.
+// Because of our tomfoolery with Raw pointers, we have to implement Debug manually to not have
+// cycles through a Dirent's parent.
+impl fmt::Debug for Dirent {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Dirent {{ parent: ")?;
+        match self.parent {
+            Some(_) => write!(f, "Some(parent)")?,
+            None    => write!(f, "None")?,
+        };
+        write!(f, ", kind: {:?}, name: {:?}, inode: {:?} }}",
+               self.kind, self.name, self.inode)
+    }
+}
+
+// Pwd is the basis for traversing and modifying our filesystem. We separate it from FileSystem
+// because we may create ephemeral Pwd's on the fly, and we don't want them to Drop and invalidate
+// our entire filesystem.
+#[derive(Debug)]
+struct Pwd(Raw<Dirent>);
+
+// FileSystem is a single in-memory filesystem that can be cloned and passed around safely. A
+// single FileSystem must be unique. It cannot be cloned. On drop, the entire filesystem is
+// deleted.
 #[derive(Debug)]
 struct FileSystem {
-    root: Arc<RwLock<Dirent>>,
-    pwd:  Arc<RwLock<Dirent>>,
+    root: Raw<Dirent>,
+    pwd:  Pwd,
+}
+
+impl Deref for FileSystem {
+    type Target = Pwd;
+
+    fn deref(&self) -> &Pwd {
+        &self.pwd
+    }
+}
+
+impl Drop for FileSystem {
+    fn drop(&mut self) {
+        let mut todo = Vec::new();
+        todo.push(self.root);
+        while let Some(elem) = todo.pop() {
+            let rs = unsafe { Box::from_raw(elem.ptr()) };
+            if let DeKind::Dir(ref d) = rs.kind {
+                for (_, child) in d {
+                    todo.push(*child);
+                }
+            }
+        }
+    }
 }
 
 fn path_empty<P: AsRef<Path>>(path: P) -> bool {
-    path.as_ref() == Path::new("")
+    path.as_ref().as_os_str().len() == 0
 }
 
 // We claim that two filesystems are equal if they have the same structure, contents, and modes.
+// This should only be used for testing and definitely is not the most concurrently safe thing.
 impl PartialEq for FileSystem {
-    fn eq(&self, other: &FileSystem) -> bool {
-        fn eq_at(l: Arc<RwLock<Dirent>>, r: Arc<RwLock<Dirent>>) -> bool {
-            let l = l.read();
-            let r = r.read();
-            if l.mode != r.mode ||
+    fn eq(&self, other: &Self) -> bool {
+        fn eq_at(l: Raw<Dirent>, r: Raw<Dirent>) -> bool {
+            if l.inode.perms() != r.inode.perms() ||
                 l.name != r.name {
                 return false;
             }
@@ -915,7 +1098,7 @@ impl PartialEq for FileSystem {
                     }
                     for (child_name, cl) in dl.iter() {
                         match dr.get(child_name) {
-                            Some(cr) => if !eq_at(cl.clone(), cr.clone()) {
+                            Some(cr) => if !eq_at(*cl, *cr) {
                                 return false;
                             },
                             None => return false,
@@ -928,34 +1111,35 @@ impl PartialEq for FileSystem {
             }
         }
 
-        eq_at(self.root.clone(), other.root.clone())
+        eq_at(self.root, other.root)
     }
 }
 
-impl FileSystem {
+impl Pwd {
     // up_path traverses up parent directories in a normalized path, erroring if we cannot cd into
     // (exec) the parent directory. This function does nothing with symlinks, meaning if the
     // filesystem is _inside_ of a symlink, functions with relative paths need handled somehow.
+    // Note that changing directories does not change their atime.
     fn up_path(&self,
                parts: path_parts::Parts)
-               -> Result<(Arc<RwLock<Dirent>>, path_parts::Parts)> {
+               -> Result<(Raw<Dirent>, path_parts::Parts)> {
         // If (normalized) parts begins at root, there are no ParentDirs.
+        let mut up = self.0;
         if parts.at_root() {
-            return Ok((self.root.clone(), parts));
+            while let Some(parent) = up.parent {
+                up = parent;
+            }
+            return Ok((up, parts));
         }
 
         // `up` is what we return: the dirent after traversing up all ParentDirs in `parts`.
-        let mut up = self.pwd.clone();
         let mut parts_iter = parts.into_iter().peekable();
         while parts_iter.peek()
                         .and_then(|part| if *part == Part::ParentDir { Some(()) } else { None })
                         .is_some() {
             parts_iter.next();
-            if let Some(parent) = {
-                let up = up.read();
-                up.parent.upgrade().as_ref().cloned()
-            } {
-                if !parent.read().executable() {
+            if let Some(parent) = up.parent {
+                if !parent.executable() {
                     return Err(EACCES());
                 }
                 up = parent;
@@ -977,7 +1161,7 @@ impl FileSystem {
     fn traverse(&self,
                 parts: path_parts::Parts,
                 level: &mut u8)
-                -> Result<(Arc<RwLock<Dirent>>, Option<OsString>)> {
+                -> Result<(Raw<Dirent>, Option<OsString>)> {
         if {*level += 1; *level} == 40 {
             return Err(ELOOP());
         }
@@ -986,28 +1170,25 @@ impl FileSystem {
         let mut parts_iter = parts.into_iter().peek2able();
         // Until the base of the input path, we change down paths.
         while parts_iter.peek2().is_some() {
-            if !fs.read().executable() {
-                return Err(EACCES());
-            }
-
             fs = {
-                let borrow = fs.read();
-                match borrow.kind {
+                if !fs.executable() {
+                    return Err(EACCES());
+                }
+                match fs.kind {
                     // We are at a normal directory: change down into the child, if it exists.
-                    DeKind::Dir(ref children) => children.get(parts_iter.next()
-                                                                        .expect("peek2 is Some, next is None")
-                                                                        .as_normal()
-                                                                        .expect("parts_iter should be Normal after up_path"))
-                                                         .cloned()
-                                                         .ok_or_else(ENOENT)?,
+                    DeKind::Dir(ref children) => children
+                                                 .get(parts_iter
+                                                      .next()
+                                                      .expect("peek2 is Some, next is None")
+                                                      .as_normal()
+                                                      .expect("parts_iter should be Normal after up_path"))
+                                                 .cloned()
+                                                 .ok_or_else(ENOENT)?,
 
                     // We are at a symlink! We have to traverse the symlink before we can continue
                     // with parts_iter.
                     DeKind::Symlink(ref sl) => {
-                        let (fs, may_base) = (&FileSystem {
-                            root: self.root.clone(),
-                            pwd:  fs.clone(),
-                        }).traverse(path_parts::normalize(sl), level)?;
+                        let (fs, may_base) = Pwd(fs).traverse(path_parts::normalize(sl), level)?;
                         match may_base {
                             Some(base) => {
                                 let parts: path_parts::Parts = Part::Normal(base).into();
@@ -1049,7 +1230,7 @@ impl FileSystem {
                 }
             };
         }
-        if !fs.read().is_dir() {
+        if !fs.is_dir() {
             return Err(ENOTDIR());
         }
 
@@ -1072,58 +1253,49 @@ impl FileSystem {
                 if path_empty(&path) {
                     return Ok(());
                 } else { // the path resulted in root or parent directories only
-                    self.pwd = fs;
+                    self.0 = fs;
                     return Ok(());
                 }
             }
         };
-        let fs = fs.read();
+        if !fs.executable() {
+            return Err(EACCES());
+        }
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
-                match child.read().kind {
+                self.0 = match child.kind {
                     DeKind::File(_) => return Err(ENOTDIR()),
                     DeKind::Symlink(ref sl) => {
-                        let og_pwd = self.pwd.clone();
-                        self.pwd = child.clone();
                         if {*level += 1; *level} == 40 {
                             return Err(ELOOP());
                         }
-                        let res = self.cd(sl, level);
-                        if res.is_err() {
-                            self.pwd = og_pwd;
-                            res?;
-                        }
-                        return Ok(())
+                        let mut ephemeral = Pwd(*child);
+                        ephemeral.cd(sl, level)?;
+                        ephemeral.0
                     },
-                    _ => (),
-                }
-                self.pwd = child.clone();
+                    _ => *child,
+                };
                 Ok(())
             }
             None => Err(ENOENT()),
         }
     }
 
-    // This implements fs::canonicalize. It's a bit ugly, but we do what we gotta do. FileSystem
+    // This implements fs::canonicalize. It's a bit ugly, but we do what we gotta do. A filesystem
     // has no direct path down to a dirent, so we have to find where the end of the path is and
     // build the resulting path backwards to the root directory.
     //
     // This function is the _only_ reason Dirent's have `name`.
     fn canonicalize<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<PathBuf> {
-        fn build_from_fs(mut fs: Arc<RwLock<Dirent>>) -> Result<PathBuf> {
+        fn build_from_fs(mut fs: Raw<Dirent>) -> Result<PathBuf> {
             let mut rev = Vec::new();
             loop {
-                if fs.read().name.len() == 0 {
+                if fs.name.len() == 0 {
                     break
                 }
                 fs = {
-                    rev.push(fs.read().name.clone());
-                    let fs = fs.read();
-                    fs.parent
-                      .upgrade()
-                      .as_ref()
-                      .cloned()
-                      .expect("a non-root directory should have a parent, only root has no name")
+                    rev.push(fs.name.clone());
+                    fs.parent.expect("a non-root directory should have a parent, only root has no name")
                 }
             }
             rev.reverse();
@@ -1144,25 +1316,20 @@ impl FileSystem {
             }
         };
 
-        let fs = fs.read();
         if !fs.executable() {
             return Err(EACCES());
         }
 
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
-                let borrow = child.read();
-                if let DeKind::Symlink(ref sl) = borrow.kind {
+                if let DeKind::Symlink(ref sl) = child.kind {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return (&FileSystem {
-                        root: self.root.clone(),
-                        pwd:  child.clone(),
-                    }).canonicalize(sl, level);
+                    return Pwd(*child).canonicalize(sl, level);
                 }
-                build_from_fs(child.clone())
-            },
+                build_from_fs(*child)
+            }
             None => Err(ENOENT()),
         }
 
@@ -1170,43 +1337,38 @@ impl FileSystem {
 
     // create_dir creates directories, failing is the directory exists and can_exist is false.
     fn create_dir<P: AsRef<Path>>(&self, path: P, mode: u32, can_exist: bool) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
+        let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(&path) {
-                    return Err(ENOENT());
-                } else { // fs is at either root or a parent directory
-                    if can_exist {
-                        return Ok(());
-                    }
-                    return Err(EEXIST());
+            None => if path_empty(&path) {
+                return Err(ENOENT());
+            } else { // fs is at either root or a parent directory
+                if can_exist {
+                    return Ok(());
                 }
+                return Err(EEXIST());
             }
         };
 
-        {
-            let fs = fs.read();
-            if !fs.executable() || !fs.writable() {
-                return Err(EACCES());
-            }
+        if !fs.changeable() {
+            return Err(EACCES());
         }
 
-        let mut borrow = fs.write();
-        match borrow.kind.dir_mut().entry(base.clone()) {
+        let parent = fs;
+        match fs.kind.dir_mut().entry(base.clone()) {
             Entry::Occupied(o) => {
-                if can_exist && o.get().read().is_dir() {
+                if can_exist && o.get().is_dir() {
                     return Ok(());
                 }
                 Err(EEXIST())
             }
             Entry::Vacant(v) => {
-                v.insert(Arc::new(RwLock::new(Dirent {
-                    parent: Arc::downgrade(&fs),
+                v.insert(Raw::from(Dirent {
+                    parent: Some(parent),
                     kind:   DeKind::Dir(HashMap::new()),
-                    mode:   mode,
                     name:   base,
-                })));
+                    inode:  Inode::new(mode, Ftyp::Dir, DIRLEN),
+                }));
                 Ok(())
             }
         }
@@ -1225,58 +1387,61 @@ impl FileSystem {
     fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
         let (src_fs, src_may_base) = self.traverse(path_parts::normalize(&src), &mut 0)?;
         let src_base = src_may_base.ok_or_else(EPERM)?; // I don't know why it is EPERM, but it is.
-        let (dst_fs, dst_may_base) = self.traverse(path_parts::normalize(&dst), &mut 0)?;
-        let dst_base = dst_may_base.ok_or_else(EEXIST)?;
 
-        let src_fs = src_fs.read();
+        // The error order appears to be:
+        // - src dir must be executable
+        // - dst must be dir (validated in traverse)
+        // - dst must be executable
+        // - src must exist
+        // - dst file must not exist
+        // - dst must be writable
+        // - src must be file
         if !src_fs.executable() {
             return Err(EACCES());
         }
 
-        {
-            let dst_fs = dst_fs.read();
-            if !dst_fs.executable() || !dst_fs.writable() {
-                return Err(EACCES());
-            }
-        }
+        let (mut dst_fs, dst_may_base) = self.traverse(path_parts::normalize(&dst), &mut 0)?;
+        let dst_base = dst_may_base.ok_or_else(EEXIST)?;
 
-        // We could do a bunch of nested match arms here, but we'll just clone. Efficiency is not
-        // a virtue in this module yet.
+        if !dst_fs.executable() {
+            return Err(EACCES());
+        }
         let src_child = match src_fs.kind.dir_ref().get(&src_base) {
-            Some(child) => child.clone(),
+            Some(child) => child,
             None => return Err(ENOENT()),
         };
+        if let Some(_) = dst_fs.kind.dir_ref().get(&dst_base) {
+            return Err(EEXIST());
+        }
+        if !dst_fs.writable() {
+            return Err(EACCES());
+        }
 
-        let dst_exists = match dst_fs.read().kind.dir_ref().get(&dst_base) {
-            Some(_) => true,
-            None => false
-        };
-
-        let src_child = src_child.read();
+        let parent = dst_fs;
         match src_child.kind {
             DeKind::Dir(_) => Err(EPERM()),
-            DeKind::Symlink(ref sl) => if dst_exists {
-                Err(EEXIST())
-            } else {
-                dst_fs.write().kind.dir_mut().insert(dst_base.clone(),
-                                                     Arc::new(RwLock::new(Dirent {
-                                                         parent: Arc::downgrade(&dst_fs),
-                                                         kind:   DeKind::Symlink(sl.clone()),
-                                                         mode:   src_child.mode, // always 0o777
-                                                         name:   dst_base,
-                                                     })));
+            DeKind::Symlink(ref sl) => {
+                dst_fs.kind
+                      .dir_mut()
+                      .insert(dst_base.clone(),
+                              Raw::from(Dirent {
+                                  parent: Some(parent),
+                                  kind:   DeKind::Symlink(sl.clone()),
+                                  name:   dst_base,
+                                  inode:  src_child.inode.clone(),
+                              }));
                 Ok(())
-            },
-            DeKind::File(ref f) => if dst_exists {
-                Err(EEXIST())
-            } else {
-                dst_fs.write().kind.dir_mut().insert(dst_base.clone(),
-                                                     Arc::new(RwLock::new(Dirent {
-                                                         parent: Arc::downgrade(&dst_fs),
-                                                         kind:   DeKind::File(f.clone()),
-                                                         mode:   src_child.mode,
-                                                         name:   dst_base,
-                                                     })));
+            }
+            DeKind::File(ref f) => {
+                dst_fs.kind
+                      .dir_mut()
+                      .insert(dst_base.clone(),
+                              Raw::from(Dirent {
+                                  parent: Some(parent),
+                                  kind:   DeKind::File(f.clone()),
+                                  name:   dst_base,
+                                  inode:  src_child.inode.clone(),
+                              }));
                 Ok(())
             }
         }
@@ -1285,27 +1450,28 @@ impl FileSystem {
     // symlink itself is an incredibly easy function to implement, so long as all the scaffolding
     // handling symlinks properly for directory traversal is already in place.
     fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
-        let (dst_fs, dst_may_base) = self.traverse(path_parts::normalize(&dst), &mut 0)?;
+        let (mut dst_fs, dst_may_base) = self.traverse(path_parts::normalize(&dst), &mut 0)?;
         let dst_base = dst_may_base.ok_or_else(EEXIST)?;
 
-        {
-            let dst_fs = dst_fs.read();
-            if !dst_fs.executable() || !dst_fs.writable() {
-                return Err(EACCES());
-            }
-
-            if dst_fs.kind.dir_ref().get(&dst_base).is_some() {
-                return Err(EEXIST());
-            }
+        if !dst_fs.changeable() {
+            return Err(EACCES());
         }
 
-        dst_fs.write().kind.dir_mut().insert(dst_base.clone(),
-                                             Arc::new(RwLock::new(Dirent {
-                                                 parent: Arc::downgrade(&dst_fs),
-                                                 kind:   DeKind::Symlink(src.as_ref().to_owned()),
-                                                 mode:   0o777, // symlink modes are always 0o777
-                                                 name:   dst_base,
-                                             })));
+        if dst_fs.kind.dir_ref().get(&dst_base).is_some() {
+            return Err(EEXIST());
+        }
+
+        let base_len = dst_base.len();
+        let parent = dst_fs;
+        dst_fs.kind
+              .dir_mut()
+              .insert(dst_base.clone(),
+                      Raw::from(Dirent {
+                          parent: Some(parent),
+                          kind:   DeKind::Symlink(src.as_ref().to_owned()),
+                          name:   dst_base,
+                          inode:  Inode::new(0o777, Ftyp::Symlink, base_len),
+                      }));
         Ok(())
     }
 
@@ -1323,19 +1489,12 @@ impl FileSystem {
     // trying to parse the returned metadata and path name would be a bit convoluted.
     fn metadata<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<Metadata> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
-        let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(path) {
-                    return Err(ENOENT());
-                } else { // this is either the root dir or a parent dir
-                    return Ok(Metadata {
-                        filetype: FileType(Ftyp::Dir),
-                        perms:    Permissions::from_mode(fs.mode),
-                        length:   DIRLEN,
-                    });
-                }
+            None => if path_empty(path) {
+                return Err(ENOENT());
+            } else { // this is either the root dir or a parent dir
+                return Ok(Metadata(fs.inode.view()));
             }
         };
 
@@ -1345,25 +1504,14 @@ impl FileSystem {
 
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
-                let child = child.read();
-                Ok(match child.kind {
-                    DeKind::Dir(_) => Metadata {
-                        filetype: FileType(Ftyp::Dir),
-                        length:   DIRLEN,
-                        perms:    Permissions::from_mode(child.mode),
-                    },
-                    DeKind::File(ref f) => Metadata {
-                        filetype: FileType(Ftyp::File),
-                        length:   f.read().data.len() as u64,
-                        perms:    Permissions::from_mode(child.mode),
-                    },
-                    DeKind::Symlink(ref sl) => {
-                        if {*level += 1; *level} == 40 {
-                            return Err(ELOOP());
-                        }
-                        self.metadata(sl, level)?
+                let meta = child.inode.view();
+                if meta.ftyp.is_symlink() {
+                    if {*level += 1; *level} == 40 {
+                        return Err(ELOOP());
                     }
-                })
+                    return Pwd(*child).metadata(child.kind.symlink_ref(), level);
+                }
+                Ok(Metadata(meta))
             }
             None => Err(ENOENT()),
         }
@@ -1374,34 +1522,30 @@ impl FileSystem {
     // This function takes a recursion level as it may be recursive if the end of path is a symlink.
     fn read_dir<P: AsRef<Path>>(&self, path: P, level: &mut u8) -> Result<ReadDir> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
-        let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(&path) {
-                    return Err(ENOENT());
-                } else { // path resolved to root or parent paths
-                    return ReadDir::new(&path, &*fs);
-                }
+            None => if path_empty(&path) {
+                return Err(ENOENT());
+            } else { // path resolved to root or parent paths
+                return ReadDir::new(&path, &*fs);
             }
         };
 
+        if !fs.executable() {
+            return Err(EACCES());
+        }
+
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
-                let borrow = child.read();
                 // If the base of the path is a symlink, we ReadDir that.
-                if let DeKind::Symlink(ref sl) = borrow.kind {
+                if let DeKind::Symlink(ref sl) = child.kind {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return (&FileSystem {
-                        root: self.root.clone(),
-                        pwd:  child.clone(),
-                    }).read_dir(sl, level);
+                    return Pwd(*child).read_dir(sl, level);
                 }
-                // Otherwise, we ReadDir whatever this is. ReadDir::new bails with ENOTDIR if it is
-                // given a file.
-                ReadDir::new(&path, &borrow)
+                // Otherwise we ReadDir whatever this is - ReadDir::new handles ENOTDIR.
+                ReadDir::new(&path, &*child)
             },
             None => Err(ENOENT()),
         }
@@ -1409,51 +1553,45 @@ impl FileSystem {
 
     fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
-        let base = may_base.ok_or_else(|| if path_empty(&path) {
-                                              ENOENT()
-                                          } else {
-                                              EINVAL()
-                                          })?;
-        let fs = fs.read();
-        if !fs.readable() {
+        let base = may_base.ok_or_else(||
+            if path_empty(&path) {
+                ENOENT()
+            } else {
+                EINVAL()
+            })?;
+
+        if !fs.executable() {
             return Err(EACCES());
         }
         match fs.kind.dir_ref().get(&base) {
-            Some(child) => {
-                let child = child.read();
-                match child.kind {
-                    DeKind::Symlink(ref sl) => Ok(sl.clone()),
-                    _ => Err(EINVAL()),
-                }
-            }
+            Some(child) => match child.kind {
+                DeKind::Symlink(ref sl) => Ok(sl.clone()),
+                _ => Err(EINVAL()),
+            },
             None => Err(ENOENT()),
         }
     }
 
     fn remove<P: AsRef<Path>>(&self, path: P, kind: FileType) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
-        let base = may_base.ok_or_else(|| if path_empty(&path) {
-                                              ENOENT()
-                                          } else {
-                                              ENOTEMPTY()
-                                          })?;
+        let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
+        let base = may_base.ok_or_else(||
+            if path_empty(&path) {
+                ENOENT()
+            } else {
+                ENOTEMPTY()
+            })?;
 
-        {
-            let fs = fs.read();
-            if !fs.executable() || !fs.writable() {
-                return Err(EACCES());
-            }
-        }
 
         // We need to make sure that the FileType being requested for removal matches the FileType
-        // of the directory. Scope this check so it drops before we mutate.
+        // of the directory. Scope this check so child drops before we mutate it.
         {
-            let fs = fs.read();
+            if !fs.changeable() {
+                return Err(EACCES());
+            }
             let child = fs.kind
                           .dir_ref()
                           .get(&base)
-                          .ok_or_else(ENOENT)?
-                          .read();
+                          .ok_or_else(ENOENT)?;
 
             match kind.0 {
                 // Symlinks and files are just simply removed, but directories must be empty.
@@ -1469,7 +1607,12 @@ impl FileSystem {
             }
         }
 
-        fs.write().kind.dir_mut().remove(&base);
+        // Because I'm a masochist, we have to clean up the memory behind our filesystem outselves.
+        let removed = fs.kind
+                        .dir_mut()
+                        .remove(&base)
+                        .expect("remove logic checking existence is wrong");
+        unsafe { Box::from_raw(removed.ptr()); }
         Ok(())
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -1483,9 +1626,8 @@ impl FileSystem {
         // Rust's remove_dir_all is actually very weak (weaker than rm -r). Rust relies on read_dir
         // to recurse, which requires `ls`. Standard linux is able to remove empty directories with
         // only write and execute privileges. This code attempts to mimic what Rust will do.
-        fn recursive_remove(fs: Arc<RwLock<Dirent>>) -> Result<()> {
-            let mut fs = fs.write();
-            let accessible = fs.readable() && fs.executable() && fs.writable();
+        fn recursive_remove(mut fs: Raw<Dirent>) -> Result<()> {
+            let accessible = fs.rremovable();
             match fs.kind {
                 DeKind::Dir(ref mut children) => {
                     if !accessible {
@@ -1503,44 +1645,37 @@ impl FileSystem {
                         // recursive removes work alphabetically
                         child_names.sort_by_key(|&(k, _)| k);
 
-                        let mut err = None;
+                        let mut err = Ok(());
                         for &(child_name, child) in &child_names {
                             match recursive_remove(child.clone()) {
                                 Ok(_) => deleted.push(child_name.clone()),
-                                Err(e) => {
-                                    err = Some(e);
-                                    break;
-                                },
+                                Err(e) => err = Err(e),
                             }
                         }
-                        match err {
-                            Some(e) => Err(e),
-                            None => Ok(()),
-                        }
+                        err
                     };
-                    // We have to remove everything we successfully recursively deleted.
+                    // We have to actually remove everything we successfully recursively "deleted".
                     for child_name in deleted {
-                        children.remove(&child_name);
+                        let removed = children.remove(&child_name)
+                                              .expect("deleted has child_name not in child map");
+                        unsafe { Box::from_raw(removed.ptr()); } // free the memory
                     }
                     res?
                 }
-                DeKind::File(ref mut f) => f.write().invalidate(),
-                DeKind::Symlink(_) => (), // symlinks are never recursively traversed
+                _ => (), // symlinks and files are simply removed
             }
             Ok(())
         }
 
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
+        let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
         match may_base {
             Some(base) => { // removing a non-root path
-                let mut fs = fs.write();
-                if !fs.executable() || !fs.writable() {
+                if !fs.changeable() {
                     return Err(EACCES());
                 }
-                let children = fs.kind.dir_mut();
-                if let Entry::Occupied(child) = children.entry(base) {
-                    recursive_remove(child.get().clone())?;
-                    child.remove();
+                if let Entry::Occupied(child) = fs.kind.dir_mut().entry(base) {
+                    recursive_remove(*child.get())?;
+                    unsafe { Box::from_raw(child.remove().ptr()); }
                 }
             }
             None => { // removing either a direct parent directory or everything under root.
@@ -1549,50 +1684,52 @@ impl FileSystem {
                 }
                 // TODO we can remove the fs under us. This is valid, but future IO operations
                 // should completely fail unless we are at root and root is what remains.
-                recursive_remove(fs.clone())?;
+                recursive_remove(fs)?;
             }
         }
         Ok(())
     }
 
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
-        let (old_fs, old_may_base) = self.traverse(path_parts::normalize(&from), &mut 0)?;
-        let old_base = old_may_base.ok_or_else(|| if path_empty(&from) {
-                                                      ENOENT()
-                                                  } else if !Arc::ptr_eq(&old_fs, &self.root) {
-                                                          // Renaming purely through parent
-                                                          // directories returns EBUSY.
-                                                          EBUSY()
-                                                  } else {
-                                                      // I really don't want to support this,
-                                                      // nor manually test what can happen.
-                                                      Error::new(ErrorKind::Other,
-                                                                 "rename of root unimplemented")
-                                                  })?;
-        let (new_fs, new_may_base) = self.traverse(path_parts::normalize(&to), &mut 0)?;
-        let new_base =
-            new_may_base.ok_or_else(|| if path_empty(&to) { ENOENT() } else { EEXIST() })?;
+        let (mut old_fs, old_may_base) = self.traverse(path_parts::normalize(&from), &mut 0)?;
+        let old_base = old_may_base.ok_or_else(||
+            if path_empty(&from) {
+                ENOENT()
+            } else if let Some(_) = old_fs.parent {
+                EBUSY() // renaming through parent directories returns EBUSY
+            } else {
+                // I really don't want to support this, nor manually test what can happen.
+                Error::new(ErrorKind::Other, "rename of root unimplemented")
+            })?;
+        let (mut new_fs, new_may_base) = self.traverse(path_parts::normalize(&to), &mut 0)?;
+        let new_base = new_may_base.ok_or_else(||
+            if path_empty(&to) {
+                ENOENT()
+            } else if let Some(_) = new_fs.parent {
+                EBUSY()
+            } else {
+                EEXIST()
+            })?;
 
-        if Arc::ptr_eq(&old_fs, &new_fs) && old_base == new_base {
+        if Raw::ptr_eq(&old_fs, &new_fs) && old_base == new_base {
             return Ok(());
         }
 
-        {
-            let old_fs = old_fs.read();
-            if !old_fs.executable() || !old_fs.writable() {
-                return Err(EACCES());
-            }
-            let new_fs = new_fs.read();
-            if !new_fs.executable() || !new_fs.writable() {
-                return Err(EACCES());
-            }
+        // The error order appears to be:
+        // - both dirs must be executable
+        // - file must exist
+        // - both dirs must be writable
+        // - files must be the same type (and for directories, empty)
+
+        if !old_fs.executable() || !new_fs.executable() {
+            return Err(EACCES());
         }
 
         // Rust's rename is strong, but also annoying, in that it can rename a directory to a
         // directory if that directory is empty. We could make the code elegant, but this will do.
         let (old_exist, old_is_dir) =
-            match old_fs.read().kind.dir_ref().get(&old_base) {
-                Some(child) => (true, child.read().is_dir()),
+            match old_fs.kind.dir_ref().get(&old_base) {
+                Some(child) => (true, child.is_dir()),
                 None => (false, false),
             };
 
@@ -1600,14 +1737,16 @@ impl FileSystem {
             return Err(ENOENT());
         }
 
+        if !old_fs.writable() || !new_fs.writable() {
+            return Err(EACCES());
+        }
+
         let (new_exist, new_is_dir, new_is_empty) =
-            match new_fs.read().kind.dir_ref().get(&new_base) {
-                Some(child) => {
-                    match child.read().kind {
-                        DeKind::Dir(ref children) => (true, true, children.is_empty()),
-                        _ => (true, false, false),
-                    }
-                }
+            match new_fs.kind.dir_ref().get(&new_base) {
+                Some(child) => match child.kind {
+                    DeKind::Dir(ref children) => (true, true, children.is_empty()),
+                    _ => (true, false, false),
+                },
                 None => (false, false, false),
             };
 
@@ -1625,48 +1764,46 @@ impl FileSystem {
             }
         }
 
-        let removed = old_fs.write().kind.dir_mut().remove(&old_base)
-                                              .expect("logic verifying dirent existence is wrong");
-        removed.write().name = new_base.clone();
-        new_fs.write().kind.dir_mut().insert(new_base, removed);
+        let mut renamed = old_fs.kind.dir_mut().remove(&old_base)
+                            .expect("logic verifying dirent existence is wrong");
+        renamed.name = new_base.clone();
+        let mut inode = renamed.inode.write();
+        inode.times.update(MODIFIED|ACCESSED|CREATED);
+        inode.length = new_base.len();
+        new_fs.kind.dir_mut().insert(new_base, renamed);
         Ok(())
     }
 
     // set_permissions implements chmod, traversing symlinks as necessary.
     //
     // This function takes a recursion level as it may be recursive if the end of path is a symlink.
-    fn set_permissions<P: AsRef<Path>>(&self, path: P, mode: u32, level: &mut u8) -> Result<()> {
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
+    fn set_permissions<P: AsRef<Path>>(&self, path: P, perms: Permissions, level: &mut u8) -> Result<()> {
+        let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(&path) {
-                    return Err(ENOENT());
-                } else {
-                    // symlinks are always 0o777. If traverse returns no base, path resolved to
-                    // (and fs is) either the root directory or a parent directory. This is
-                    // concrete (not a symlink), so we can set its mode.
-                    fs.write().mode = mode;
-                    return Ok(());
-                }
+            None => if path_empty(&path) {
+                return Err(ENOENT());
+            } else {
+                // Symlinks are always 0o777. If traverse returns no base, path resolved to
+                // either the root directory or a parent directory - we can set perms.
+                fs.inode.write().perms = perms;
+                return Ok(());
             }
         };
-        let fs = fs.write();
+        if !fs.executable() {
+            return Err(EACCES());
+        }
         match fs.kind.dir_ref().get(&base) {
             Some(child) => {
-                // as documented just above, we cannot change the permissions of symlinks.
-                // set_permissions on symlinks actually changes what they link to, so, well, we
-                // have to do that here.
-                if let DeKind::Symlink(ref sl) = child.read().kind {
+                // set_permissions on symlinks changes what they link to, so we recurse.
+                if let DeKind::Symlink(ref sl) = child.kind {
                     if {*level += 1; *level} == 40 {
                         return Err(ELOOP());
                     }
-                    return (&FileSystem{
-                        root: self.root.clone(),
-                        pwd:  child.clone(),
-                    }).set_permissions(sl, mode, level);
+                    return Pwd(*child).set_permissions(sl, perms, level);
                 }
-                child.write().mode = mode;
+                let mut child = *child; // copy out of the borrow
+                child.inode.write().perms = perms;
                 Ok(())
             }
             None => Err(ENOENT()),
@@ -1675,19 +1812,12 @@ impl FileSystem {
 
     fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         let (fs, may_base) = self.traverse(path_parts::normalize(&path), &mut 0)?;
-        let fs = fs.read();
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(path) {
-                    return Err(ENOENT());
-                } else { // this is either the root dir or a parent dir
-                    return Ok(Metadata {
-                        filetype: FileType(Ftyp::Dir),
-                        perms:    Permissions::from_mode(fs.mode),
-                        length:   DIRLEN,
-                    });
-                }
+            None => if path_empty(path) {
+                return Err(ENOENT());
+            } else {
+                return Ok(Metadata(fs.inode.view())); // either the root dir or a parent dir
             }
         };
 
@@ -1696,26 +1826,7 @@ impl FileSystem {
         }
 
         match fs.kind.dir_ref().get(&base) {
-            Some(child) => {
-                let child = child.read();
-                Ok(match child.kind {
-                    DeKind::Dir(_) => Metadata {
-                        filetype: FileType(Ftyp::Dir),
-                        length:   DIRLEN,
-                        perms:    Permissions::from_mode(child.mode),
-                    },
-                    DeKind::File(ref f) => Metadata {
-                        filetype: FileType(Ftyp::File),
-                        length:   f.read().data.len() as u64,
-                        perms:    Permissions::from_mode(child.mode),
-                    },
-                    DeKind::Symlink(_) => Metadata {
-                        filetype: FileType(Ftyp::Symlink),
-                        length:   SYMLEN,
-                        perms:    Permissions::from_mode(child.mode),
-                    },
-                })
-            }
+            Some(child) => Ok(Metadata(child.inode.view())),
             None => Err(ENOENT()),
         }
     }
@@ -1723,7 +1834,6 @@ impl FileSystem {
     // open has to take the master filesystem (FS) because File itself can call set_permissions.
     // There is probably an avenue to clean this up.
     fn open<P: AsRef<Path>>(&self,
-                            master_fs: FS,
                             path: P,
                             options: &OpenOptions,
                             level: &mut u8)
@@ -1749,89 +1859,69 @@ impl FileSystem {
         }
 
         // Now, on with (potentially) opening.
-        let (fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
+        let (mut fs, may_base) = self.traverse(path_parts::normalize(&path), level)?;
         let base = match may_base {
             Some(base) => base,
-            None => {
-                if path_empty(&path) {
-                    return Err(ENOENT());
-                } else { // root or parent directories only (both of which,
-                         // being dirs, fail immediately in open_existing)
-                    return Self::open_existing(master_fs, path, &fs, &options);
-                }
+            None => if path_empty(&path) {
+                return Err(ENOENT());
+            } else { // root or parent directories only (both of which,
+                     // being dirs, fail immediately in open_existing)
+                return Self::open_existing(&fs, &options);
             }
         };
-        if !fs.read().executable() {
+
+        if !fs.executable() {
             return Err(EACCES());
         }
-
         // If the file exists, open it.
-        if let Some(child) = fs.read().kind.dir_ref().get(&base) {
-            if let DeKind::Symlink(ref sl) = child.read().kind {
-                // Bummer, the base of our path is a symlink. Open that.
+        if let Some(child) = fs.kind.dir_ref().get(&base) {
+            if let DeKind::Symlink(ref sl) = child.kind {
                 if {*level += 1; *level} == 40 {
                     return Err(ELOOP());
                 }
-                return (&FileSystem {
-                    root: self.root.clone(),
-                    pwd:  fs.clone(),
-                }).open(master_fs, sl, &options, level);
+                return Pwd(*child).open(sl, &options, level);
             }
-            return Self::open_existing(master_fs, path, child, &options);
+            return Self::open_existing(child, &options);
         }
 
-        // From here down, we worry about creating a new file.
-        if !fs.read().writable() {
-            return Err(EACCES());
-        }
+        // From here down we worry about creating a new file.
         if !options.create {
             return Err(ENOENT());
         }
-        let file = Arc::new(RwLock::new(RawFile { // backing "inode" file
-            valid: true,
-            data:  Vec::new(),
-        }));
-        let child = Arc::new(RwLock::new(Dirent { // hard link
-            parent: Arc::downgrade(&fs),
-            kind:   DeKind::File(file.clone()),
-            mode:   options.mode,
-            name:   base.clone(),
-        }));
-        fs.write().kind.dir_mut().insert(base, child);
-        Ok(File { // file view
-            fs:   master_fs,
-            path: path.as_ref().to_owned(),
+        if !fs.writable() {
+            return Err(EACCES());
+        }
 
+        let file = Arc::new(RwLock::new(RawFile { // backing "inode" file
+            data:  Vec::new(),
+            inode: Inode::new(options.mode, Ftyp::File, 0),
+        }));
+        let child = Raw::from(Dirent {
+            parent: Some(fs),
+            kind:   DeKind::File(file.clone()),
+            name:   base.clone(),
+            inode:  file.write().inode.clone(),
+        });
+        fs.kind.dir_mut().insert(base, child);
+        Ok(File { // file view
             read:   options.read,
             write:  options.write,
             append: options.append,
 
-            metadata: Metadata {
-                filetype: FileType(Ftyp::File),
-                length:   0,
-                perms:    Permissions::from_mode(options.mode),
-            },
-
             cursor: Arc::new(Mutex::new(FileCursor {
-                file: file.clone(),
+                file: file,
                 at:   0,
             })),
         })
     }
 
     // `open_existing` opens known existing file with the given options, returning an error if the
-    // file cannot be opened with those options. This takes the master filesystem (FS) for the same
-    // reason open does: a File has set_permissions, which needs the FS...
-    fn open_existing<P: AsRef<Path>>(master_fs: FS,
-                                     path: P,
-                                     fs: &Arc<RwLock<Dirent>>,
-                                     options: &OpenOptions)
-                                     -> Result<File> {
+    // file cannot be opened with those options.
+    fn open_existing(fs: &Raw<Dirent>, options: &OpenOptions) -> Result<File> {
         if options.excl {
             return Err(EEXIST());
         }
 
-        let fs = fs.read();
         // we panic below if fs is a symlink
         if fs.is_dir() {
             if options.write {
@@ -1856,31 +1946,19 @@ impl FileSystem {
             }
             write = true;
         }
-        let (file, len) = {
-            let arc_file = fs.kind.file_ref().clone();
-            let len = {
-                let mut raw_file = arc_file.write();
-                if options.trunc {
-                    raw_file.data = Vec::new();
-                }
-                raw_file.data.len()
-            };
-            (arc_file, len)
-        };
-        Ok(File {
-            fs:   master_fs,
-            path: path.as_ref().to_owned(),
 
+        let file = fs.kind.file_ref().clone();
+        {
+            let mut raw_file = file.write();
+            if options.trunc {
+                raw_file.data = Vec::new();
+            }
+            raw_file.inode.write().times.update(ACCESSED);
+        }
+        Ok(File {
             read:   read,
             write:  write,
             append: options.append,
-
-            metadata: Metadata {
-                filetype: FileType(Ftyp::File),
-                length: len as u64,
-                perms: Permissions::from_mode(options.mode),
-            },
-
             cursor: Arc::new(Mutex::new(FileCursor {
                 file: file,
                 at:   0,
@@ -1909,102 +1987,101 @@ mod test {
     #[test]
     fn equal() {
         // First, we prove our filesystem comparison operations work.
-        // TODO add a symlink here
-        let exp_pwd = Arc::new(RwLock::new(Dirent {
-            parent: Weak::new(),
+        let mut exp_root = Raw::from(Dirent {
+            parent: None,
             kind:   DeKind::Dir(HashMap::new()),
-            mode:   0,
             name:   OsString::from(""),
-        }));
+            inode:  Inode::new(0, Ftyp::Dir, DIRLEN),
+        });
 
-        let exp = FS {
-            inner: Arc::new(Mutex::new(FileSystem {
-                root: exp_pwd.clone(),
-                pwd:  exp_pwd,
-            })),
-        };
+        let exp = FS(Arc::new(Mutex::new(FileSystem {
+                root: exp_root,
+                pwd:  Pwd(exp_root),
+            })));
         {
-            let ref mut root_rc = exp.inner.lock().pwd;
-            let mut root = root_rc.write();
-            let ref mut dir = root.kind.dir_mut();
-            dir.insert(OsString::from("lolz"),
-                        Arc::new(RwLock::new(Dirent {
-                            parent: Arc::downgrade(&root_rc),
-                            kind:   DeKind::Dir(HashMap::new()),
-                            mode:   0o666,
-                            name:   OsString::from("lolz"),
-                        })));
-            dir.insert(OsString::from("f"),
-                        Arc::new(RwLock::new(Dirent{
-                            parent: Arc::downgrade(&root_rc),
-                            kind:   DeKind::File(Arc::new(RwLock::new(RawFile{
-                                valid: false,
-                                data:  vec![1, 2, 3],
-                            }))),
-                            mode:   0o334,
-                            name:   OsString::from("f"),
-                        })));
+            let parent = exp_root;
+            let ref mut dir = exp_root.kind.dir_mut();
+            dir.insert(OsString::from("lolz"), Raw::from(Dirent {
+                parent: Some(parent),
+                kind:   DeKind::Dir(HashMap::new()),
+                name:   OsString::from("lolz"),
+                inode:  Inode::new(0o666, Ftyp::Dir, DIRLEN),
+            }));
+            let file_inode = Inode::new(0o334, Ftyp::File, 0);
+            dir.insert(OsString::from("f"), Raw::from(Dirent {
+                parent: Some(parent),
+                kind:   DeKind::File(Arc::new(RwLock::new(RawFile{
+                    data:  vec![1, 2, 3],
+                    inode: file_inode.clone(),
+                }))),
+                name:   OsString::from("f"),
+                inode:  file_inode,
+            }));
+            dir.insert(OsString::from("sl"), Raw::from(Dirent {
+                parent: Some(parent),
+                kind:   DeKind::Symlink(String::from(".././zzz").into()),
+                name:   OsString::from("sl"),
+                inode:  Inode::new(0o777, Ftyp::Symlink, 2),
+            }));
         }
 
         let fs = FS::with_mode(0o777);
         assert!(fs.new_dirbuilder().mode(0o666).create("lolz").is_ok());
         let mut f = fs.new_openopts().mode(0o334).write(true).create_new(true).open("f").unwrap();
         assert!(f.write(vec![1, 2, 3].as_slice()).is_ok());
+        assert!(fs.symlink(".././zzz", "sl").is_ok());
         assert!(fs.set_permissions("/", Permissions::from_mode(0)).is_ok());
         assert!(fs == exp);
+        // TODO this test proves that equality works, but does not prove that inequality is
+        // correct. While I have manually verified it, every piece of the above fs could be changed
+        // to prove it via a test.
     }
 
     #[test]
     fn create_dir() {
         // We just proved that file system comparisons work. Let's build a slightly more
         // complicated filesystem and then prove create_dir works.
-        let exp_pwd = Arc::new(RwLock::new(Dirent {
-            parent: Weak::new(),
+        let mut exp_root = Raw::from(Dirent {
+            parent: None,
             kind:   DeKind::Dir(HashMap::new()),
-            mode:   0o300,
             name:   OsString::from(""),
-        }));
-        let exp = FS {
-            inner: Arc::new(Mutex::new(FileSystem {
-                root: exp_pwd.clone(),
-                pwd:  exp_pwd,
-            })),
-        };
+            inode:  Inode::new(0o300, Ftyp::Dir, DIRLEN),
+        });
+        let exp = FS(Arc::new(Mutex::new(FileSystem {
+                root: exp_root,
+                pwd:  Pwd(exp_root),
+            })));
 
         {
-            let ref mut root = exp.inner.lock().pwd;
-            let mut borrow = root.write();
-            let children = borrow.kind.dir_mut();
-            children.insert(OsString::from("a"),
-                            Arc::new(RwLock::new(Dirent {
-                                parent: Arc::downgrade(&root),
-                                kind:   DeKind::Dir(HashMap::new()),
-                                mode:   0o500, // r-x: cannot create subfiles
-                                name:   OsString::from("a"),
-                            })));
-            children.insert(OsString::from("b"),
-                            Arc::new(RwLock::new(Dirent {
-                                parent: Arc::downgrade(&root),
-                                kind:   DeKind::Dir(HashMap::new()),
-                                mode:   0o600, // rw-: cannot exec (cd) into to create subfiles
-                                name:   OsString::from("b"),
-                            })));
-            let child = Arc::new(RwLock::new(Dirent {
-                parent: Arc::downgrade(&root),
+            let parent = exp_root;
+            let children = exp_root.kind.dir_mut();
+            children.insert(OsString::from("a"), Raw::from(Dirent {
+                parent: Some(parent),
                 kind:   DeKind::Dir(HashMap::new()),
-                mode:   0o300, // _wx: all we need
-                name:   OsString::from("c"),
+                name:   OsString::from("a"),
+                inode:  Inode::new(0o500, Ftyp::Dir, DIRLEN), // r-x: cannot create subiles
             }));
+            children.insert(OsString::from("b"), Raw::from(Dirent {
+                parent: Some(parent),
+                kind:   DeKind::Dir(HashMap::new()),
+                name:   OsString::from("b"),
+                inode:  Inode::new(0o600, Ftyp::Dir, DIRLEN), // rw-: cannot exec to create subfiles
+            }));
+            let mut child = Raw::from(Dirent {
+                parent: Some(parent),
+                kind:   DeKind::Dir(HashMap::new()),
+                name:   OsString::from("c"),
+                inode:  Inode::new(0o300, Ftyp::Dir, DIRLEN), // _wx: all we need
+            });
             {
-                let mut child_borrow = child.write();
-                let child_children = child_borrow.kind.dir_mut();
-                child_children.insert(OsString::from("d"),
-                                      Arc::new(RwLock::new(Dirent {
-                                          parent: Arc::downgrade(&child),
-                                          kind:   DeKind::Dir(HashMap::new()),
-                                          mode:   0o777,
-                                          name:   OsString::from("d"),
-                                      })));
+                let parent = child;
+                let child_children = child.kind.dir_mut();
+                child_children.insert(OsString::from("d"), Raw::from(Dirent {
+                    parent: Some(parent),
+                    kind:   DeKind::Dir(HashMap::new()),
+                    name:   OsString::from("d"),
+                    inode:  Inode::new(0o777, Ftyp::Dir, DIRLEN),
+                }));
             }
             children.insert(OsString::from("c"), child);
 
@@ -2070,36 +2147,14 @@ mod test {
 
     #[test]
     fn open() {
-        // First, prove that open even works (even though we tested it in the first test).
-        // Then, prove all combinations of OpenOptions work as expected.
+        // We proved open worked in the first test, so let's test OpenOptions combinations and how
+        // they interact with directories that have poor perms.
         let fs = FS::with_mode(0o700);
-        let exp = FS::with_mode(0o700);
-        {
-            let ref mut root = exp.inner.lock().pwd;
-            root.write()
-                .kind
-                .dir_mut()
-                .insert(OsString::from("a"),
-                        Arc::new(RwLock::new(Dirent {
-                            parent: Arc::downgrade(&root),
-                            kind: DeKind::File(Arc::new(RwLock::new(RawFile {
-                                valid: true,
-                                data: vec![1, 2, 3, 4],
-                            }))),
-                            mode: 0o300,
-                            name: OsString::from("a"),
-                        })));
-        }
-        let mut file = fs.new_openopts().create(true).write(true).mode(0o300).open("a").unwrap();
-        assert!(file.write(vec![1, 2, 3, 4].as_slice()).is_ok());
-
         assert!(fs.new_dirbuilder().mode(0o100).create("unwrite").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("unexec/subdir").is_ok());
         assert!(fs.new_dirbuilder().mode(0o300).recursive(true).create("okdir").is_ok());
         assert!(fs.set_permissions("unexec", Permissions::from_mode(0o200)).is_ok());
-
-        assert!(errs_eq(fs.new_openopts().write(true).open("").unwrap_err(),
-                        ENOENT()));
+        assert!(errs_eq(fs.new_openopts().write(true).open("").unwrap_err(), ENOENT()));
 
         fn test_open<P: AsRef<Path>>(on: i32,
                                      fs: &FS,
@@ -2132,9 +2187,7 @@ mod test {
                 }
                 assert!(ref_errs_eq(&res_err, &exp_err),
                         "#{}: got err {:?} != exp err {:?}",
-                        on,
-                        &res_err,
-                        &exp_err);
+                        on, &res_err, &exp_err);
                 return;
             }
 
@@ -2323,53 +2376,41 @@ mod test {
         assert!(fs.new_dirbuilder().mode(0o100).create("a/b/z").is_ok());
         assert!(fs.new_openopts().mode(0o000).write(true).create(true).open("a/b/f").is_ok());
 
+        fn de_eq(this: DirEntry, other: DirEntry) -> bool {
+            this.dir == other.dir &&
+                this.base == other.base &&
+                this.inode == other.inode
+        }
+
         let mut reader = fs.read_dir("a/b").unwrap();
-        assert_eq!(reader.next().unwrap().unwrap(),
-                   DirEntry {
-                       dir:  PathBuf::from("a/b"),
-                       base: OsString::from("c"),
-                       meta: Metadata {
-                           filetype: FileType(Ftyp::Dir),
-                           length:   DIRLEN,
-                           perms:    Permissions::from_mode(0o700),
-                       },
-                   });
-        assert_eq!(reader.next().unwrap().unwrap(),
-                   DirEntry {
-                       dir:  PathBuf::from("a/b"),
-                       base: OsString::from("d"),
-                       meta: Metadata {
-                           filetype: FileType(Ftyp::Dir),
-                           length:   DIRLEN,
-                           perms:    Permissions::from_mode(0o300),
-                       },
-                   });
+        assert!(de_eq(reader.next().unwrap().unwrap(), DirEntry {
+            dir:   PathBuf::from("a/b"),
+            base:  OsString::from("c"),
+            inode: Inode::new(0o700, Ftyp::Dir, DIRLEN),
+        }));
+        assert!(de_eq(reader.next().unwrap().unwrap(), DirEntry {
+            dir:   PathBuf::from("a/b"),
+            base:  OsString::from("d"),
+            inode: Inode::new(0o300, Ftyp::Dir, DIRLEN),
+        }));
         let next = reader.next().unwrap().unwrap();
         assert_eq!(next.path(), PathBuf::from("a/b/f"));
         assert_eq!(next.file_name(), OsString::from("f"));
-        assert_eq!(next.metadata().unwrap(),
-                   Metadata {
-                       filetype: FileType(Ftyp::File),
-                       length:   0,
-                       perms:    Permissions::from_mode(0),
-                   });
+        let meta = next.metadata().unwrap();
+        println!("{:?}", meta);
+        assert!(meta.0 == Inode::new(0, Ftyp::File, 0).view());
         let next = reader.next().unwrap().unwrap();
         assert_eq!(next.path(), PathBuf::from("a/b/z"));
         assert_eq!(next.file_name(), OsString::from("z"));
-        assert_eq!(next.metadata().unwrap(),
-                   Metadata {
-                       filetype: FileType(Ftyp::Dir),
-                       length:   DIRLEN,
-                       perms:    Permissions::from_mode(0o100),
-                   });
+        assert!(next.metadata().unwrap().0 == Inode::new(0o100, Ftyp::Dir, DIRLEN).view());
         assert!(reader.next().is_none());
     }
 
     #[test]
     fn raw_file() {
         let mut raw_file = RawFile {
-            valid: true,
             data: Vec::new(),
+            inode: Inode::new(0, Ftyp::File, 0),
         };
 
         let slice = &[1, 2, 3, 4, 5];
@@ -2401,11 +2442,19 @@ mod test {
         assert_eq!(raw_file.read_at(0, &mut output).unwrap(), 5);
         assert_eq!(&output, &[1, 1, 2, 3, 4]);
 
-        assert_eq!(raw_file.valid, true);
-        raw_file.invalidate();
-        assert_eq!(raw_file.valid, false);
-        assert!(errs_eq(raw_file.write_at(0, slice).unwrap_err(), ENOENT()));
-        assert!(errs_eq(raw_file.read_at(0, &mut output).unwrap_err(), ENOENT()));
+        assert_eq!(raw_file.inode.read().length, 6);
+
+        assert_eq!(raw_file.write_at(10, &slice[..1]).unwrap(), 1);
+        assert_eq!(raw_file.data.as_slice(), &[1, 1, 2, 3, 4, 5, 0, 0, 0, 0, 1]);
+
+        let mut output = [0u8; 2];
+        assert_eq!(raw_file.read_at(9, &mut output).unwrap(), 2);
+        assert_eq!(&output, &[0, 1]);
+
+        assert_eq!(raw_file.read_at(8, &mut output).unwrap(), 2);
+        assert_eq!(&output, &[0, 0]);
+
+        assert_eq!(raw_file.inode.read().length, 11);
     }
 
     #[test]
