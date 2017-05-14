@@ -495,6 +495,15 @@ impl fs::Metadata for Metadata {
     fn permissions(&self) -> Self::Permissions {
         self.0.perms
     }
+    fn modified(&self) -> Result<SystemTime> {
+        Ok(self.0.times.modified)
+    }
+    fn accessed(&self) -> Result<SystemTime> {
+        Ok(self.0.times.accessed)
+    }
+    fn created(&self) -> Result<SystemTime> {
+        Ok(self.0.times.created)
+    }
 }
 
 /// Options and flags which can be used to configure how a file is opened.

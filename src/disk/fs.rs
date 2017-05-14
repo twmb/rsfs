@@ -23,6 +23,7 @@ use std::fs as rs_fs;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use fs;
 
@@ -194,6 +195,15 @@ impl fs::Metadata for Metadata {
     }
     fn permissions(&self) -> Self::Permissions {
         Permissions(self.0.permissions())
+    }
+    fn modified(&self) -> Result<SystemTime> {
+        self.0.modified()
+    }
+    fn accessed(&self) -> Result<SystemTime> {
+        self.0.accessed()
+    }
+    fn created(&self) -> Result<SystemTime> {
+        self.0.created()
     }
 }
 

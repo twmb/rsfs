@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::{Read, Seek, Write};
 use std::io::Result;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// A builder used to create directories.
 ///
@@ -89,6 +90,9 @@ pub trait Metadata {
     /// Returns the permissions of the file this metadata is for.
     fn permissions(&self) -> Self::Permissions;
     /// Returns whether the file is empty. This defaults to checking `len() == 0`.
+    fn modified(&self) -> Result<SystemTime>;
+    fn accessed(&self) -> Result<SystemTime>;
+    fn created(&self) -> Result<SystemTime>;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
