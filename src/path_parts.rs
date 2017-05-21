@@ -6,10 +6,7 @@
 //! [`std::path::Path`]: https://doc.rust-lang.org/std/path/struct.Path.html
 
 use std::ffi::OsString;
-use std::iter::FromIterator;
-use std::path::{Component, Path};
-use std::slice;
-use std::vec;
+use std::path::{Component, Path, PathBuf};
 
 /// An iterator with `peek()` and `peek2()` calls that return optional references to the next
 /// element or the one after.
@@ -74,6 +71,7 @@ impl<I: Iterator> Iterator for Peek2able<I> {
 
 impl<I: Iterator> Peek2able<I> {
     /// Returns a reference to the next `.next()` value without advancing the iterator.
+    #[allow(dead_code)]
     pub fn peek(&mut self) -> Option<&I::Item> {
         if self.peek1.is_none() {
             self.peek1 = Some(self.iter.next());
@@ -84,45 +82,6 @@ impl<I: Iterator> Peek2able<I> {
             _ => unreachable!(),
         }
     }
-    /// Returns a reference to what would be the next second `.next()` value without advancing the
-    /// iterator.
-    ///
-    /// # Example
-    ///
-    /// Basic usage:
-    ///
-    /// ```
-    /// use rsfs::path_parts::IteratorExt;
-    ///
-    /// let xs = [1, 2, 3, 4];
-    ///
-    /// let mut iter = xs.iter().peek2able();
-    ///
-    /// assert_eq!(iter.peek2(), Some(&&2));
-    /// assert_eq!(iter.peek(), Some(&&1));
-    /// assert_eq!(iter.next(), Some(&1));
-    ///
-    /// assert_eq!(iter.next(), Some(&2));
-    ///
-    /// // The iterator does not advance even if we `peek` or `peek2` multiple times
-    /// assert_eq!(iter.peek(), Some(&&3));
-    /// assert_eq!(iter.peek2(), Some(&&4));
-    /// assert_eq!(iter.peek(), Some(&&3));
-    /// assert_eq!(iter.peek2(), Some(&&4));
-    ///
-    /// assert_eq!(iter.next(), Some(&3));
-    ///
-    /// // `peek2()` will return `None` when the iterator is one away from the end
-    /// assert_eq!(iter.peek2(), None);
-    /// assert_eq!(iter.peek(), Some(&&4));
-    ///
-    /// assert_eq!(iter.next(), Some(&4));
-    ///
-    /// // After the iterator is finished, so are both `peek()` and `peek2()`
-    /// assert_eq!(iter.peek2(), None);
-    /// assert_eq!(iter.peek(), None);
-    /// assert_eq!(iter.next(), None);
-    /// ```
     pub fn peek2(&mut self) -> Option<&I::Item> {
         if self.peek1.is_none() {
             self.peek1 = Some(self.iter.next());
@@ -141,7 +100,7 @@ impl<I: Iterator> Peek2able<I> {
 /// A simplified version of [`std::path::Component`].
 ///
 /// [`std::path::Component`]: https://doc.rust-lang.org/std/path/enum.Component.html
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Part {
     /// A `..` in a path that could not be normalized away.
     ParentDir,
@@ -174,101 +133,34 @@ impl Part {
 #[derive(Debug)]
 pub struct Parts {
     // at_root signifies whether the original path, normalized, began at root.
-    at_root: bool,
-    // parts contains all normal parts of a path and, if not at root, may begin with a few
+    pub at_root: bool,
+    // inner contains all normal inner of a path and, if not at root, may begin with a few
     // parent directories.
-    parts: Vec<Part>,
+    pub inner: Vec<Part>,
+}
+
+impl Default for Parts {
+    fn default() -> Parts {
+        Parts { at_root: false, inner: vec![] }
+    }
 }
 
 impl From<Part> for Parts {
     fn from(p: Part) -> Parts {
-        Parts { at_root: false, parts: vec![p] }
+        Parts { at_root: false, inner: vec![p] }
     }
 }
 
-impl Parts {
-    /// Returns whether the normalized original path began with the root directory.
-    pub fn at_root(&self) -> bool {
-        self.at_root
-    }
-}
-
-/// An iterator that borrows from of a [`Parts`].
-///
-/// This struct is created by the `into_iter` method on [`Parts`] (provided by the [`IntoIterator`]
-/// trait).
-///
-/// [`Parts`]: struct.Parts.html
-/// [`IntoIterator`]: https://doc.rust-lang.org/std/iter/trait.IntoIterator.html
-pub struct PartsIter<'a> {
-    // inner is the remaining path parts yet to iterate over.
-    inner: slice::Iter<'a, Part>,
-}
-
-impl<'a> IntoIterator for &'a mut Parts {
-    type Item = &'a Part;
-    type IntoIter = PartsIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        PartsIter { inner: self.parts.iter() }
-    }
-}
-
-impl<'a> IntoIterator for &'a Parts {
-    type Item = &'a Part;
-    type IntoIter = PartsIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        PartsIter { inner: self.parts.iter() }
-    }
-}
-
-impl<'a> Iterator for PartsIter<'a> {
-    type Item = &'a Part;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-}
-
-/// An iterator that moves out of a [`Parts`].
-///
-/// This struct is created by the `into_iter` method on [`Parts`] (provided by the [`IntoIterator`]
-/// trait).
-///
-/// [`Parts`]: struct.Parts.html
-/// [`IntoIterator`]: https://doc.rust-lang.org/std/iter/trait.IntoIterator.html
-#[derive(Debug)]
-pub struct PartsIntoIter {
-    // inner is the remaining path parts yet to iterate over.
-    inner: vec::IntoIter<Part>,
-}
-
-impl IntoIterator for Parts {
-    type Item = Part;
-    type IntoIter = PartsIntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        PartsIntoIter { inner: self.parts.into_iter() }
-    }
-}
-
-impl Iterator for PartsIntoIter {
-    type Item = Part;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-}
-
-impl FromIterator<Part> for Parts {
-    fn from_iter<I: IntoIterator<Item = Part>>(iter: I) -> Parts {
-        let mut parts = Parts {
-            at_root: false,
-            parts: Vec::new(),
-        };
-        for part in iter {
-            parts.parts.push(part)
+impl From<Parts> for PathBuf {
+    fn from(ps: Parts) -> PathBuf {
+        let mut b = PathBuf::new();
+        for p in ps.inner {
+            match p {
+                Part::ParentDir => b.push(".."),
+                Part::Normal(n) => b.push(n),
+            }
         }
-        parts
+        b
     }
 }
 
@@ -285,20 +177,20 @@ impl FromIterator<Part> for Parts {
 pub fn normalize<P: AsRef<Path>>(path: &P) -> Parts {
     let mut ps = Parts {
         at_root: false,
-        parts: Vec::new(),
+        inner: Vec::new(),
     };
     for comp in path.as_ref().components() {
         match comp {
             Component::RootDir => ps.at_root = true,
             Component::ParentDir => {
-                if ps.at_root || ps.parts.last().map_or(false, |last| *last != Part::ParentDir) {
-                    ps.parts.pop();
+                if ps.at_root || ps.inner.last().map_or(false, |last| *last != Part::ParentDir) {
+                    ps.inner.pop();
                 } else {
-                    ps.parts.push(Part::ParentDir);
+                    ps.inner.push(Part::ParentDir);
                 }
             }
             Component::Normal(p) => {
-                ps.parts.push(Part::Normal(p.to_os_string()));
+                ps.inner.push(Part::Normal(p.to_os_string()));
             }
             _ => (),
         }

@@ -37,6 +37,6 @@ pub mod unix_ext;
 pub mod disk;
 pub mod mem;
 pub mod errors;
-pub mod path_parts;
 
+mod path_parts;
 mod ptr;
