@@ -1,59 +1,4 @@
-//! An in memory filesystem.
-//!
-//! The [`FS`] provides an in memory file system. This implementation, only available on Unix
-//! systems, implements all [`unix_ext`] traits. Errors returned mimic true Unix error codes via
-//! the [`errors`] crate (which may not have the proper error codes for _all_ possible Unix systems
-//! yet).
-//!
-//! All API calls to FS operate under a mutex to ensure consistency. Reads to [`File`]s can be
-//! concurrent.
-//!
-//! # Example
-//!
-//! ```
-//! use std::ffi::OsString;
-//! use std::io::{Read, Seek, SeekFrom, Write};
-//! use std::path::PathBuf;
-//!
-//! use rsfs::*;
-//! use rsfs::unix_ext::*;
-//! use rsfs::mem::fs::FS;
-//!
-//! // setup a few directories
-//!
-//! let fs = FS::with_mode(0o300);
-//! assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
-//!
-//! // open a file, write to it, and read from it
-//!
-//! let mut wf = fs.new_openopts().mode(0o600).write(true).create_new(true).open("a/f").unwrap();
-//! assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
-//!
-//! let mut rf = fs.new_openopts().read(true).open("a/f").unwrap();
-//! assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-//!
-//! let mut output = [0u8; 4];
-//! assert_eq!(rf.read(&mut output).unwrap(), 4);
-//! assert_eq!(&output, &[1, 2, 3, 4]);
-//!
-//! // read a directory
-//!
-//! let mut reader = fs.read_dir("a").unwrap();
-//!
-//! let next = reader.next().unwrap().unwrap();
-//! assert_eq!(next.file_name(), OsString::from("b"));
-//! assert_eq!(next.path(), PathBuf::from("a/b"));
-//!
-//! let next = reader.next().unwrap().unwrap();
-//! assert_eq!(next.file_name(), OsString::from("f"));
-//! assert_eq!(next.path(), PathBuf::from("a/f"));
-//!
-//! assert!(reader.next().is_none());
-//! ```
-//!
-//! [`FS`]: struct.FS.html
-//! [`unix_ext`]: ../unix_ext/index.html
-//! [`errors`]: ../errors/index.html
+//! This module provides an in memory filesystem. It is `pub use`d in `rsfs::mem`.
 
 extern crate parking_lot;
 
@@ -78,24 +23,37 @@ use errors::*;
 use path_parts::{normalize, IteratorExt, Part, Parts};
 use ptr::Raw;
 
-// How much can be refactored so that Windows support can be easily added?
-
-// DIRLEN is the length returned from Metadata's len() call for a directory. This is pulled from
-// the initial file size that Unix uses for a directory sector. This module does not attempt to
-// return a larger number if the directory contains many children with long names.
+/// `DIRLEN` is the length returned from `Metadata`s len() call for a directory. This is pulled
+/// from the initial file size that Unix uses for a directory sector. This module does not attempt
+/// to return a larger number if the directory contains many children with long names.
 const DIRLEN: usize = 4096;
 
 /// A builder used to create directories in various manners.
 ///
-/// See the module [documentation] for a comprehensive example.
+/// This builder implements [`rsfs::DirBuilder`] and supports [unix extensions].
 ///
-/// [documentation]: index.html
+/// [`rsfs::DirBuilder`]: ../trait.DirBuilder.html
+/// [unix extensions]: ../unix_ext/trait.DirBuilderExt.html
+///
+/// # Examples
+/// 
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # fn foo() -> std::io::Result<()> {
+/// let fs = FS::new();
+/// let db = fs.new_dirbuilder();
+/// db.create("dir")?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct DirBuilder {
     // fs is what we reach inside to create our directory.
     fs: FS,
-
+    // recursive indicates that nested directories will be created recursively.
     recursive: bool,
+    // mode is the unix mode to set on directories when creating them.
     mode:      u32,
 }
 
@@ -120,10 +78,26 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 
 /// Entries returned by the [`ReadDir`] iterator.
 ///
-/// See the module [documentation] for a comprehensive example.
+/// An instance of `DirEntry` implements [`rsfs::DirEntry`] and represents an entry inside a
+/// directory on the in memory filesystem.
 ///
+/// [`rsfs::DirEntry`]: ../trait.DirEntry.html
 /// [`ReadDir`]: struct.ReadDir.html
-/// [documentation]: index.html
+///
+/// # Examples
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # fn foo() -> std::io::Result<()> {
+/// let fs = FS::new();
+/// for entry in fs.read_dir(".")? {
+///     let entry = entry?;
+///     println!("{:?}: {:?}", entry.path(), entry.metadata()?.permissions());
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct DirEntry {
     // dir is the original path requested for ReadDir. We make no attempt to clean it.
@@ -154,9 +128,9 @@ impl fs::DirEntry for DirEntry {
     }
 }
 
-// RawFile is the underling contents of a file in our filesystem. OpenOption's .open() call returns
-// a view of a file. If a file is removed from the filesystem, currently open files can still be
-// read from or written to, but the file will not be openable anymore.
+/// `RawFile` is the underlying contents of a file in our filesystem. `OpenOption`s .open() call
+/// returns a view of a file. If a file is removed from the filesystem, currently open files can
+/// still be read from or written to, but the file will not be openable anymore.
 #[derive(Debug)]
 struct RawFile {
     // data is the backing file data.
@@ -166,7 +140,7 @@ struct RawFile {
 }
 
 impl RawFile {
-    // read_at reads contents of the file into dst from a given index in the file.
+    /// read_at reads contents of the file into dst from a given index in the file.
     fn read_at(&self, at: usize, dst: &mut [u8]) -> Result<usize> {
         self.inode.write().times.update(ACCESSED);
 
@@ -182,8 +156,8 @@ impl RawFile {
         Ok(copy_size)
     }
 
-    // write_at writes to the RawFile at a given index, zero extending the existing data if
-    // necessary.
+    /// write_at writes to the RawFile at a given index, zero extending the existing data if
+    /// necessary.
     fn write_at(&mut self, at: usize, src: &[u8]) -> Result<usize> {
         if src.is_empty() {
             return Ok(0)
@@ -213,12 +187,26 @@ impl RawFile {
 /// A view into a file on the filesystem.
 ///
 /// An instance of `File` can be read or written to depending on the options it was opened with.
-/// Files also implement `Seek` to alter the logical cursor position into the file (only `SeekFrom`
-/// is currently implemented).
+/// Files also implement `Seek` to alter the logical cursor position of the internal file.
 ///
-/// See the module [documentation] for a comprehensive example.
+/// This struct implements [`rsfs::File`] and has [unix extensions].
 ///
-/// [documentation]: index.html
+/// [`rsfs::File`]: ../trait.File.html
+/// [unix extensions]: ../unix_ext/trait.FileExt.html
+///
+/// # Examples
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # use std::io::Write;
+/// # fn foo() -> std::io::Result<()> {
+/// let fs = FS::new();
+/// let mut f = fs.create_file("f")?;
+/// assert_eq!(f.write(&[1, 2, 3])?, 3);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct File {
     read:   bool,
@@ -274,8 +262,9 @@ impl fs::File for File {
     }
 }
 
-// FileCursor corresponds to an actual file descriptor, which, "behind the scenes", keeps track of
-// where we are in a file.
+/// `FileCursor` corresponds to an actual file descriptor, which, "behind the scenes", keeps track
+/// of where we are in a file. We use a FileCursor to support File's cloning and to support
+/// implementing read/write/seek on a &'a File.
 #[derive(Debug)]
 struct FileCursor {
     file: Arc<RwLock<RawFile>>,
@@ -298,7 +287,7 @@ impl FileCursor {
             }
             // If data is longer, simply truncate it.
             Ordering::Greater => file.data.truncate(size),
-            // set_len to the length data is? Do nothing!
+            // If equal, we get to do nothing.
             _ => (),
         }
         Ok(())
@@ -430,7 +419,7 @@ impl unix_ext::FileExt for File {
     }
 }
 
-// Ftyp is the actual underlying enum for a FileType.
+/// Ftyp is the actual underlying enum for a FileType.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum Ftyp {
     File,
@@ -438,7 +427,25 @@ enum Ftyp {
     Symlink,
 }
 
-/// Represents the type of a file.
+/// Returned from [`Metadata::file_type`], this structure represents the type of a file.
+///
+/// This structure implements [`rsfs::FileType`]
+///
+/// [`Metadata::file_type`]: ../trait.Metadata.html#tymethod.file_type
+/// [`rsfs::FileType`]: ../trait.FileType.html
+///
+/// # Examples
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # fn foo() -> std::io::Result<()> {
+/// let fs = FS::new();
+/// let f = fs.create_file("f")?;
+/// assert!(fs.metadata("f")?.file_type().is_file());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FileType(Ftyp);
 
@@ -456,9 +463,25 @@ impl fs::FileType for FileType {
 
 /// Metadata information about a file.
 ///
-/// See the module [documentation] for a comprehensive example.
+/// This structure, which implements [`rsfs::Metadata`], is returned from the [`metadata`] or
+/// [`symlink_metadata`] methods and represents known metadata information about a file at the
+/// instant in time this structure is instantiated.
 ///
-/// [documentation]: index.html
+/// [`rsfs::Metadata`]: ../trait.Metadata.html
+/// [`metadata`]: ../trait.GenFS.html#tymethod.metadata
+/// [`symlink_metadata`]: ../trait.GenFS.html#tymethod.symlink_metadata
+///
+/// # Examples
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # fn foo() -> std::io::Result<()> {
+/// let fs = FS::new();
+/// fs.create_file("f")?;
+/// println!("{:?}", fs.metadata("f")?);
+/// # Ok(())
+/// # }
 #[derive(Clone, Debug)]
 pub struct Metadata(InodeData); // Metadata is a copy of InodeData at a point in time.
 
@@ -494,9 +517,49 @@ impl fs::Metadata for Metadata {
 
 /// Options and flags which can be used to configure how a file is opened.
 ///
-/// See the module [documentation] for a comprehensive example.
+/// This builder, created from `GenFS`s [`new_openopts`], exposes the ability to configure how a
+/// [`File`] is opened and what operations are permitted on the open file. `GenFS`s [`open_file`]
+/// and [`create_file`] methods are aliases for commonly used options with this builder.
 ///
-/// [documentation]: index.html
+/// This builder implements [`rsfs::OpenOptions`] and supports [unix extensions].
+///
+/// [`new_openopts`]: ../trait.GenFS.html#tymethod.new_openopts
+/// [`open_file`]: ../trait.GenFS.html#tymethod.open_file
+/// [`create_file`]: ../trait.GenFS.html#tymethod.create_file
+/// [`rsfs::OpenOptions`]: ../trait.OpenOptions.html
+/// [unix extensions]: ../unix_ext/trait.OpenOptionsExt.html
+///
+/// # Examples
+///
+/// Opening a file to read:
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # fn foo() -> std::io::Result<()> {
+/// # let fs = FS::new();
+/// let f = fs.new_openopts()
+///           .read(true)
+///           .open("f")?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Opening a file for both reading and writing, as well as creating it if it doesn't exist:
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// # fn foo() -> std::io::Result<()> {
+/// # let fs = FS::new();
+/// let mut f = fs.new_openopts()
+///               .read(true)
+///               .write(true)
+///               .create(true)
+///               .open("f")?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     fs:     FS,
@@ -545,6 +608,27 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
 }
 
 /// Representation of the various permissions on a file.
+///
+/// This struct implements [`rsfs::Permissions`] and has [unix extensions].
+///
+/// [`rsfs::Permissions`]: ../trait.Permissions.html
+/// [unix extensions]: ../unix_ext/trait.PermissionsExt.html
+///
+/// # Examples
+///
+/// ```
+/// # use rsfs::*;
+/// # use rsfs::mem::FS;
+/// use rsfs::unix_ext::*;
+/// use rsfs::mem::Permissions;
+/// # fn foo() -> std::io::Result<()> {
+/// # let fs = FS::new();
+/// # fs.create_file("foo.txt")?;
+///
+/// fs.set_permissions("foo.txt", Permissions::from_mode(0o400))?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Permissions(u32);
 
@@ -576,13 +660,12 @@ impl unix_ext::PermissionsExt for Permissions {
 
 /// Iterator over entries in a directory.
 ///
-/// This is returned from the [`read_dir`] method of [`std::mem::FS`].
-///
-/// See the module [documentation] for a comprehensive example.
+/// This is returned from the [`read_dir`] method of `GenFS` and yields instances of
+/// `io::Result<DirEntry>`. Through a [`DirEntry`], information about contents of a directory can
+/// be learned.
 ///
 /// [`read_dir`]: struct.FS.html#method.read_dir
-/// [`std::mem::FS`]: struct.FS.html
-/// [documentation]: index.html
+/// [`DirEntry`]: struct.DirEntry.html
 #[derive(Debug)]
 pub struct ReadDir {
     ents: IntoIter<DirEntry>,
@@ -629,18 +712,28 @@ impl Iterator for ReadDir {
     }
 }
 
-/// An in memory struct that satisfies [`rsfs::FS`].
+/// An in memory struct that satisfies [`rsfs::GenFS`].
 ///
 /// `FS` is thread safe and copyable. It operates internally with an `Arc<Mutex<FileSystem>>`
 /// (`FileSystem` not being exported) and forces all filesystem calls to go through the mutex. `FS`
-/// attempts to mimic all real errors that could occur on a filesystem. Generally, unless you setup
-/// an in memory system with low permissions, the only errors you could encounter would be from
-/// performing operations on non-existing files or performing operations that expect non-existence.
+/// attempts to mimic all real errors that could occur on a filesystem. Generally, unless a `FS` is
+/// setup with restrictive permissions, errors will only be encountered when operating on
+/// non-existent filesystem entries or performing invalid oprations.
 ///
-/// See the module [documentation] for a comprehensive example.
+/// See the module [documentation] or every struct's documentation for more examples of using an
+/// `FS`.
 ///
-/// [`rsfs::FS`]: ../trait.FS.html
+/// [`rsfs::GenFS`]: ../trait.GenFS.html
 /// [documentation]: index.html
+///
+/// # Examples
+/// 
+/// ```
+/// use rsfs::*;
+/// use rsfs::mem::FS;
+///
+/// let fs = FS::new();
+/// ```
 #[derive(Clone, Debug)]
 pub struct FS(Arc<Mutex<FileSystem>>);
 
@@ -687,11 +780,27 @@ impl fmt::Display for FS {
 
 impl FS {
     /// Creates an empty `FS` with mode `0o777`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsfs::*;
+    /// # use rsfs::mem::FS;
+    /// let fs = FS::new();
+    /// ```
     pub fn new() -> FS {
         Self::with_mode(0o777)
     }
 
     /// Creates an empty `FS` with the given mode.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsfs::*;
+    /// # use rsfs::mem::FS;
+    /// let fs = FS::with_mode(0o300);
+    /// ```
     pub fn with_mode(mode: u32) -> FS {
         let pwd = Raw::from(Dirent {
             parent: None,
@@ -826,23 +935,23 @@ impl fs::GenFS for FS {
         }
     }
 
-    fn file_open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+    fn open_file<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
         use fs::OpenOptions;
         self.new_openopts().read(true).open(path.as_ref())
     }
-    fn file_create<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+    fn create_file<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
         use fs::OpenOptions;
         self.new_openopts().write(true).create(true).truncate(true).open(path.as_ref())
     }
 }
 
-impl unix_ext::FSExt for FS {
+impl unix_ext::GenFSExt for FS {
     fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
         self.0.lock().symlink(src, dst)
     }
 }
 
-// Times tracks the modified, accessed, and created time for a Dirent.
+/// Times tracks the modified, accessed, and created time for a Dirent.
 #[derive(Copy, Clone, Debug)]
 struct Times {
     modified: SystemTime,
@@ -850,8 +959,11 @@ struct Times {
     created:  SystemTime,
 }
 
+/// Bitflag indicating a Dirent was modified.
 const MODIFIED: u8 = 1; // modified time
+/// Bitflag indicating a Dirent was accessed.
 const ACCESSED: u8 = 2; // accessed time
+/// Bitflag indicating a Dirent was created.
 const CREATED:  u8 = 4; // created time
 
 impl Times {
@@ -882,6 +994,10 @@ impl Times {
     }
 }
 
+/// InodeData is the backing shared data of an "inode". Unix systems can have multiple files
+/// pointing to the same inode. We minimally mimic that in this code. We don't recreate a full unix
+/// filesystem, but the following data is shared behind a mutex when creating hard links or raw
+/// files.
 #[derive(Copy, Clone, Debug)]
 struct InodeData {
     times:  Times,
@@ -898,6 +1014,7 @@ impl PartialEq for InodeData {
     }
 }
 
+/// Inode is what makes sharing InodeData between hard links / dirents / raw files possible.
 #[derive(Clone, Debug)]
 struct Inode(Arc<RwLock<InodeData>>);
 
@@ -934,8 +1051,8 @@ impl Deref for Inode {
     }
 }
 
-// DeKind differentiates between files, directories, and symlinks. It mildly duplicates information
-// that is available in InodeData's ftyp.
+/// DeKind differentiates between files, directories, and symlinks. It mildly duplicates
+/// information that is available in InodeData's ftyp.
 #[derive(Debug)]
 enum DeKind {
     File(Arc<RwLock<RawFile>>),
@@ -970,18 +1087,18 @@ impl DeKind {
     }
 }
 
-// Dirent represents all information needed at a node in our filesystem tree. We use raw pointers
-// to traverse dirents. It's "unsafe", so we have a myriad of tests ensuring it isn't.
-//
-// We use Raw because the real alternative is Arc<RwLock<_>> around every Dirent (inside the
-// HashMap and inside the parent). Doing this would force a clone and a read lock on every
-// directory traversal. After writing all FS operations using Arc/RwLock, I am not so sure that
-// this is even safe - it's possible (and hard to reason about) that some combination of directory
-// traversals could hold a read lock blocking a write lock.
-//
-// More importantly, having two filesystem operations occuring simultaneously is completely unsafe.
-// Think about what would happen if we need to rename something from /a/b/c to /d/e/f at the same
-// time that we are recursively removing /d. We would deadlock.
+/// Dirent represents all information needed at a node in our filesystem tree. We use raw pointers
+/// to traverse dirents. It's "unsafe", so we have a myriad of tests ensuring it isn't.
+///
+/// We use Raw because the real alternative is Arc<RwLock<_>> around every Dirent (inside the
+/// HashMap and inside the parent). Doing this would force a clone and a read lock on every
+/// directory traversal. After writing all FS operations using Arc/RwLock, I am not so sure that
+/// this is even safe - it's possible (and hard to reason about) that some combination of directory
+/// traversals could hold a read lock blocking a write lock.
+///
+/// More importantly, having two filesystem operations occuring simultaneously is completely
+/// unsafe. Think about what would happen if we need to rename something from /a/b/c to /d/e/f at
+/// the same time that we are recursively removing /d. We would deadlock.
 struct Dirent {
     parent: Option<Raw<Dirent>>,
     kind:   DeKind,
@@ -1006,12 +1123,12 @@ impl Dirent {
     fn executable(&self) -> bool {
         self.inode.perms().0 & 0o100 == 0o100
     }
-    // changeable implies executable and writable. Executable is always needed when attempting to
-    // write to a directory.
+    /// changeable implies executable and writable. Executable is always needed when attempting to
+    /// write to a directory.
     fn changeable(&self) -> bool {
         self.inode.perms().0 & 0o300 == 0o300
     }
-    // Only recursive removes need completely open permissions.
+    /// Only recursive removes need completely open permissions.
     fn rremovable(&self) -> bool {
         self.inode.perms().0 & 0o700 == 0o700
     }
@@ -1031,18 +1148,18 @@ impl fmt::Debug for Dirent {
     }
 }
 
-// Pwd is the basis for traversing and modifying our filesystem. We separate it from FileSystem
-// because we occasionally create ephemeral Pwd's on the fly, and we don't want a Pwd's Drop and
-// invalidate our entire filesystem.
-//
-// Recursive removes can delete the filesystem from underneath us - we can recursively remove a
-// parent directory. We need to invalidate the filesystem when that happens. Additionally, When a
-// filesystem drops, we need to delete everything under root. What happens if we recursively
-// removed root already? Pwd's `alive` covers both cases.
-//
-// If our Pwd was removed, alive is false, and all operations fail. Any time we use root, we check
-// if Pwd is alive and, if it is not, we pointer compare root and Pwd's inner. If they are equal,
-// root is unusable (because alive being false means Pwd's inner has been dropped).
+/// Pwd is the basis for traversing and modifying our filesystem. We separate it from FileSystem
+/// because we occasionally create ephemeral Pwd's on the fly, and we don't want a Pwd's Drop and
+/// invalidate our entire filesystem.
+///
+/// Recursive removes can delete the filesystem from underneath us - we can recursively remove a
+/// parent directory. We need to invalidate the filesystem when that happens. Additionally, When a
+/// filesystem drops, we need to delete everything under root. What happens if we recursively
+/// removed root already? Pwd's `alive` covers both cases.
+///
+/// If our Pwd was removed, alive is false, and all operations fail. Any time we use root, we check
+/// if Pwd is alive and, if it is not, we pointer compare root and Pwd's inner. If they are equal,
+/// root is unusable (because alive being false means Pwd's inner has been dropped).
 #[derive(Debug)]
 struct Pwd {
     inner: Raw<Dirent>,
@@ -1058,10 +1175,13 @@ impl From<Raw<Dirent>> for Pwd {
     }
 }
 
-// FileSystem is a single in-memory filesystem that can be cloned and passed around safely. A
-// single FileSystem must be unique. On drop, the entire filesystem is deleted.
+/// FileSystem is a single in-memory filesystem that can be cloned and passed around safely. A
+/// single FileSystem must be unique. On drop, the entire filesystem is deleted.
 #[derive(Debug)]
 struct FileSystem {
+    // root exists for preemptive support for changing the current working directory. `cd` used to
+    // exist, but was removed after adding symlink support. `root` held on to the original root
+    // directory as needed.
     root: Raw<Dirent>,
     pwd:  Pwd,
 }
@@ -1082,11 +1202,9 @@ impl DerefMut for FileSystem {
 
 impl Drop for FileSystem {
     fn drop(&mut self) {
-        if !self.pwd.alive {
-            if Raw::ptr_eq(&self.root, &self.pwd.inner) {
-                // It appears we have dropped ourself already.
-                return;
-            }
+        if !self.pwd.alive && Raw::ptr_eq(&self.root, &self.pwd.inner) {
+            // It appears we have dropped ourself already.
+            return;
         }
 
         let mut todo = Vec::new();
@@ -1620,10 +1738,8 @@ impl Pwd {
         // We will do this by comparing every deleted dirent to our pwd, and, if one is our pwd, we
         // will invalidate ourself.
         fn maybe_kill_self(pwd: &mut Pwd, removed: &Raw<Dirent>) {
-            if pwd.alive {
-                if Raw::ptr_eq(removed, &pwd.inner) {
-                    pwd.alive = false;
-                }
+            if pwd.alive && Raw::ptr_eq(removed, &pwd.inner) {
+                pwd.alive = false;
             }
         }
         // Rust's remove_dir_all is actually very weak (weaker than rm -r). Rust relies on read_dir
@@ -1973,13 +2089,14 @@ impl Pwd {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use fs::{DirEntry as DirEntryTrait, File, GenFS, OpenOptions};
     use std::ffi::OsString;
     use std::io::Error;
     use std::sync::mpsc;
     use std::thread;
+
+    use fs::{DirEntry as DirEntryTrait, File, GenFS, OpenOptions};
     use unix_ext::*;
+    use super::*;
 
     impl PartialEq for FS {
         fn eq(&self, other: &Self) -> bool {
@@ -2340,8 +2457,8 @@ mod test {
         assert!(errs_eq(fs.set_permissions("a", Permissions::from_mode(0)).unwrap_err(), EINVAL()));
         assert!(errs_eq(fs.symlink_metadata("a").unwrap_err(), EINVAL()));
         assert!(errs_eq(fs.symlink("a", "b").unwrap_err(), EINVAL()));
-        assert!(errs_eq(fs.file_open("a").unwrap_err(), EINVAL()));
-        assert!(errs_eq(fs.file_create("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.open_file("a").unwrap_err(), EINVAL()));
+        assert!(errs_eq(fs.create_file("a").unwrap_err(), EINVAL()));
         assert!(errs_eq(fs.new_openopts().write(true).create(true).open("a").unwrap_err(), EINVAL()));
         assert!(errs_eq(fs.new_dirbuilder().create("a").unwrap_err(), EINVAL()));
     }
@@ -2527,11 +2644,11 @@ mod test {
         assert!(fs.symlink("f", "sl").is_ok());
 
         assert!(fs.new_dirbuilder().mode(0).create("a").is_ok()); // EACCES
-        assert!(fs.file_create("b").is_ok()); // ENOTDIR
+        assert!(fs.create_file("b").is_ok()); // ENOTDIR
         assert!(fs.new_dirbuilder().mode(0).create("c").is_ok()); // EACCES
 
         assert!(fs.create_dir("d").is_ok());
-        assert!(fs.file_create("d/f").is_ok()); // EEXIST
+        assert!(fs.create_file("d/f").is_ok()); // EEXIST
 
         assert!(fs.new_dirbuilder().mode(0o100).create("e").is_ok()); // EACCES
 
@@ -2565,14 +2682,14 @@ mod test {
 
 
         {
-            let f = fs.file_open("ls").unwrap(); // through linked (copied) symlink to f
+            let f = fs.open_file("ls").unwrap(); // through linked (copied) symlink to f
             let cursor = f.cursor.lock();
             let file = cursor.file.read();
             assert_eq!(file.data.as_slice(), &[1, 2, 3, 1, 2, 3]);
         }
 
         {
-            let f = fs.file_open("cpy").unwrap(); // ensure our copied file is still normal
+            let f = fs.open_file("cpy").unwrap(); // ensure our copied file is still normal
             let cursor = f.cursor.lock();
             let file = cursor.file.read();
             assert_eq!(file.data.as_slice(), &[1, 2, 3]);
@@ -2602,9 +2719,9 @@ mod test {
         assert!(fs.symlink(".././a", "goodbye/sl").is_ok());
         assert!(fs.create_dir("a").is_ok());
         assert!(fs.create_dir("sl/sl/b").is_ok());
-        assert!(fs.file_create("sl/sl/f").is_ok());
+        assert!(fs.create_file("sl/sl/f").is_ok());
         assert!(exp.create_dir_all("a/b").is_ok());
-        assert!(exp.file_create("a/f").is_ok());
+        assert!(exp.create_file("a/f").is_ok());
         assert!(exp.create_dir("goodbye").is_ok());
         assert!(exp.symlink(".././a", "goodbye/sl").is_ok());
         assert!(fs == exp);
@@ -2680,7 +2797,7 @@ mod test {
         assert!(errs_eq(fs.metadata("z").unwrap_err(), ELOOP()));
         assert!(errs_eq(fs.read_dir("z").unwrap_err(), ELOOP()));
         assert!(errs_eq(fs.set_permissions("z", Permissions::from_mode(0)).unwrap_err(), ELOOP()));
-        assert!(errs_eq(fs.file_open("z").unwrap_err(), ELOOP()));
+        assert!(errs_eq(fs.open_file("z").unwrap_err(), ELOOP()));
 
         assert!(exp.symlink("z", "z").is_ok());
         assert!(fs == exp);
