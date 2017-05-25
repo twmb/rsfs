@@ -1,204 +1,78 @@
-//! An in memory filesystem that allows error injection.
-//!
-//! The [`FS`] provides an in memory file system that allows injecting errors. This module is built
-//! on top of the [`mem`] module provided by this crate; read that module documentation first to
-//! understand how the in memory aspects of this filesystem will behave.
-//!
-//! Injected errors are consumed via a FIFO queue. The calling API passes a sequence of closures
-//! that will be passed which function a filesystem call is in if the function can error. The
-//! sequence of closures is drained as they return `Some(Result)`; if a closure returns `None`, the
-//! closure is not drained from the sequence.
-//!
+//! This module provides an in-memory filesystem, error injectable filesystem. It is `pub use`d in
+//! `rsfs::mem::test`.
 
-// # Example
-//
-// ```
-// use rsfs::*;
-// use rsfs::errors::*;
-// use rsfs::unix_ext::*;
-// use rsfs::mem::test::fs::{FS, In, AtFile};
-// use std::io::{Read, Result, Seek, SeekFrom, Write};
-//
-// let fs = FS::with_mode(0o300);
-//
-//
-// // open a file, write some content...
-// let mut wf =
-//     fs.new_openopts().mode(0o600).write(true).create_new(true).open("f").unwrap();
-// assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
-//
-// // open the file for reading...
-// let mut rf = fs.new_openopts().read(true).open("f").unwrap();
-//
-// // read some content, consuming the first closure in the sequence...
-// let mut output = [0u8; 4];
-// assert_eq!(rf.read(&mut output).unwrap(), 4);
-// assert_eq!(&output, &[0, 1, 2, 3]);
-//
-// // notice that other file operations will not fail
-// assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-//
-// // consume the second closure, which will error...
-// assert!(rf.read(&mut output).is_err());
-//
-// // now we are back to normal and that same read will be successful...
-// assert_eq!(rf.read(&mut output).unwrap(), 4);
-// assert_eq!(&output, &[1, 2, 3, 4]);
-// ```
-//
-// [`FS`]: struct.FS.html
-// [`mem`]: ../mem/index.html
-//
+// TODO redo this entire API.
 
 extern crate parking_lot;
 
 use std::cmp;
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use self::parking_lot::Mutex;
 
 use fs;
-use mem::fs as mem;
 use unix_ext;
+use mem::unix as mem;
 
-/// The `testfs` is about to call a [`DirBuilder`] method.
-///
-/// [`DirBuilder`]: ../fs/trait.DirBuilder.html
-pub enum AtDirBuilder<'inj: 'p, 'p> {
-    /// The next call will be [`create`].
-    ///
-    /// [`create`]: ../fs/trait.DirBuilder.html#tymethod.create
-    Create(&'p DirBuilder<'inj>, &'p PathBuf),
+/// The `testfs` is about to call a method on a file that can error.
+pub enum InFile<'p> {
+    Read(&'p File, &'p [u8]),
+    Write(&'p File, &'p [u8]),
+    ReadAt(&'p File, &'p [u8], u64),
+    WriteAt(&'p File, &'p [u8], u64),
 }
 
-/// The `testfs` is about to call a [`DirEntry`] method.
-///
-/// [`DirEntry`]: ../fs/trait.DirEntry.html
-pub enum AtDirEntry<'inj: 'p, 'p> {
-    /// The next call will be [`metadata`].
-    ///
-    /// [`metadata`]: ../fs/trait.DirEntry.html#tymethod.metadata
-    Metadata(&'p DirEntry<'inj>),
-    /// The next call will be [`file_type`].
-    ///
-    /// [`file_type`]: ../fs/trait.DirEntry.html#tymethod.file_type
-    FileType(&'p DirEntry<'inj>),
-}
-
-/// The `testfs` is about to call a [`File`] method.
-///
-/// [`File`]: ../fs/trait.File.html
-pub enum AtFile<'inj: 'p, 'p> {
-    /// The next call will be [`metadata`].
-    ///
-    /// [`metadata`]: ../fs/trait.File.html#tymethod.metadata
-    Metadata(&'p File<'inj>),
-    /// The next call will be [`flush`].
-    ///
-    /// [`flush`]: https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush
-    Flush(&'p File<'inj>),
-    /// The next call will be [`seek`].
-    ///
-    /// [`seek`]: https://doc.rust-lang.org/std/io/trait.Seek.html#tymethod.seek
-    Seek(&'p File<'inj>, &'p SeekFrom),
-}
-
-pub enum AtFilePartial<'inj: 'p, 'p> {
-    Read(&'p File<'inj>, &'p [u8]),
-    Write(&'p File<'inj>, &'p [u8]),
-}
-
-/// The `testfs` is about to call an [`OpenOptions`] method.
-///
-/// [`OpenOptions`]: ../fs/trait.OpenOptions.html
-pub enum AtOpenOptions<'inj: 'p, 'p> {
-    /// The next call will be [`open`].
-    ///
-    /// [`open`]: ../fs/trait.OpenOptions.html#tymethod.open
-    Open(&'p OpenOptions<'inj>, &'p PathBuf),
-}
-
-/// The `testfs` is about to call a [`ReadDir`] method.
-///
-/// [`ReadDir`]: ../fs/trait.ReadDir.html
-pub enum AtReadDir<'inj: 'p, 'p> {
-    /// The next call will be [`next`].
-    ///
-    /// [`next`]: https://doc.rust-lang.org/std/iter/trait.Iterator.html#tymethod.next
-    Next(&'p ReadDir<'inj>),
-}
-
-/// The `testfs` is about to call an [`FS`] method.
-///
-/// [`FS`]: ../fs/trait.FS.html
-pub enum AtFS<'p> {
-    /// The next call will be [`metadata`].
-    ///
-    /// [`metadata`]: ../fs/trait.FS.html#tymethod.metadata
-    Metadata(&'p PathBuf),
-    /// The next call will be [`read_dir`].
-    ///
-    /// [`read_dir`]: ../fs/trait.FS.html#tymethod.read_dir
-    ReadDir(&'p PathBuf),
-    /// The next call will be [`remove_dir`].
-    ///
-    /// [`remove_dir`]: ../fs/trait.FS.html#tymethod.remove_dir
-    RemoveDir(&'p PathBuf),
-    /// The next call will be [`remove_dir_all`].
-    ///
-    /// [`remove_dir_all`]: ../fs/trait.FS.html#tymethod.remove_dir_all
-    RemoveDirAll(&'p PathBuf),
-    /// The next call will be [`remove_file`].
-    ///
-    /// [`remove_file`]: ../fs/trait.FS.html#tymethod.remove_file
-    RemoveFile(&'p PathBuf),
-    /// The next call will be [`rename`].
-    ///
-    /// [`rename`]: ../fs/trait.FS.html#tymethod.rename
-    Rename(&'p PathBuf, &'p PathBuf),
-    /// The next call will be [`set_permissions`].
-    ///
-    /// [`set_permissions`]: ../fs/trait.FS.html#tymethod.set_permissions
-    SetPermissions(&'p PathBuf, &'p mem::Permissions),
+impl<'a> InFile<'a> {
+    pub fn buf_len(&'a self) -> usize {
+        match *self {
+            InFile::Read(_, b) => b.len(),
+            InFile::Write(_, b) => b.len(),
+            InFile::ReadAt(_, b, _) => b.len(),
+            InFile::WriteAt(_, b, _) => b.len(),
+        }
+    }
 }
 
 /// The `testfs` is about to call a method that can error.
-pub enum In<'inj: 'p, 'p> {
-    /// The `testfs` is about to call a [`DirBuilder`] method. See the [`AtDirBuilder`]
-    /// enum.
-    ///
-    /// [`DirBuilder`]: ../fs/trait.DirBuilder.html
-    /// [`AtDirBuilder`]: enum.AtDirBuilder.html
-    DirBuilder(AtDirBuilder<'inj, 'p>),
-    /// The `testfs` is about to call a [`DirEntry`] method. See the [`AtDirEntry`] enum.
-    ///
-    /// [`DirEntry`]: ../fs/trait.DirEntry.html
-    /// [`AtDirEntry`]: enum.AtDirEntry.html
-    DirEntry(AtDirEntry<'inj, 'p>),
-    /// The `testfs` is about to call a [`File`] method. See the [`AtFile`] enum.
-    ///
-    /// [`File`]: ../fs/trait.File.html
-    /// [`AtFile`]: enum.AtFile.html
-    File(AtFile<'inj, 'p>),
-    /// The `testfs` is about to call an [`OpenOptions`] method. See the
-    /// [`AtOpenOptions`] enum.
-    ///
-    /// [`OpenOptions`]: ../fs/trait.OpenOptions.html
-    /// [`AtOpenOptions`]: enum.AtOpenOptions.html
-    OpenOptions(AtOpenOptions<'inj, 'p>),
-    /// The `testfs` is about to call a [`ReadDir`] method. See the [`AtReadDir`] enum.
-    ///
-    /// [`ReadDir`]: ../fs/trait.ReadDir.html
-    /// [`AtReadDir`]: enum.AtReadDir.html
-    ReadDir(AtReadDir<'inj, 'p>),
-    /// The `testfs` is about to call an [`FS`] method. See the [`AtFS`] enum.
-    ///
-    /// [`FS`]: ../fs/trait.FS.html
-    /// [`AtFS`]: enum.AtFS.html
-    FS(AtFS<'p>),
+pub enum In<'p> {
+    DirBuilderCreate(&'p DirBuilder, &'p PathBuf),
+    DirEntryMetadata(&'p DirEntry),
+    DirEntryFileType(&'p DirEntry),
+    FileSyncAll(&'p File),
+    FileSyncData(&'p File),
+    FileSetLen(&'p File, u64),
+    FileMetadata(&'p File),
+    FileTryClone(&'p File),
+    FileSetPermissions(&'p File, mem::Permissions),
+    FileFlush(&'p File),
+    FileSeek(&'p File, &'p SeekFrom),
+    MetadataModified(&'p Metadata),
+    MetadataAccessed(&'p Metadata),
+    MetadataCreated(&'p Metadata),
+    OpenOptionsOpen(&'p OpenOptions, &'p PathBuf),
+    ReadDirNext(&'p ReadDir),
+    FSCanonicalize(&'p PathBuf),
+    FSCopy(&'p PathBuf, &'p PathBuf),
+    FSCreateDir(&'p PathBuf),
+    FSCreateDirAll(&'p PathBuf),
+    FSHardLink(&'p PathBuf, &'p PathBuf),
+    FSMetadata(&'p PathBuf),
+    FSReadDir(&'p PathBuf),
+    FSReadLink(&'p PathBuf),
+    FSRemoveDir(&'p PathBuf),
+    FSRemoveDirAll(&'p PathBuf),
+    FSRemoveFile(&'p PathBuf),
+    FSRename(&'p PathBuf, &'p PathBuf),
+    FSSetPermissions(&'p PathBuf, &'p mem::Permissions),
+    FSSymlinkMetadata(&'p PathBuf),
+    FSOpenFile(&'p PathBuf),
+    FSCreateFile(&'p PathBuf),
+    FSSymlink(&'p PathBuf, &'p PathBuf)
 }
 
 /// A builder used to create directories in various manners.
@@ -209,33 +83,36 @@ pub enum In<'inj: 'p, 'p> {
 /// [`mem::DirBuilder`]: ../mem/struct.DirBuilder.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct DirBuilder<'inj> {
-    injector: InjectFn<'inj>,
+pub struct DirBuilder {
+    injector: InjectFn,
     pub inner: mem::DirBuilder,
 }
 
-impl<'inj> fs::DirBuilder for DirBuilder<'inj> {
+impl fmt::Debug for DirBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "DirBuilder {{ inner: {:?} }}", &self.inner)
+    }
+}
+
+impl fs::DirBuilder for DirBuilder {
     fn recursive(&mut self, recursive: bool) -> &mut Self {
-        self.inner.recursive(recursive);
-        self
+        self.inner.recursive(recursive); self
     }
     fn create<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
-               .as_mut()
-               .map(|f| {
-                        f(In::DirBuilder(AtDirBuilder::Create(self, &path.as_ref().to_owned())))
-                    }) {
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::DirBuilderCreate(self, &path.as_ref().to_owned()))) {
             r?;
         }
         self.inner.create(path)
     }
 }
 
-impl<'inj> unix_ext::DirBuilderExt for DirBuilder<'inj> {
+impl unix_ext::DirBuilderExt for DirBuilder {
     fn mode(&mut self, mode: u32) -> &mut Self {
-        self.inner.mode(mode);
-        self
+        self.inner.mode(mode); self
     }
 }
 
@@ -248,13 +125,19 @@ impl<'inj> unix_ext::DirBuilderExt for DirBuilder<'inj> {
 /// [`mem::DirEntry`]: ../mem/struct.DirEntry.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct DirEntry<'inj> {
-    injector: InjectFn<'inj>,
+pub struct DirEntry {
+    injector: InjectFn,
     pub inner: mem::DirEntry,
 }
 
-impl<'inj> fs::DirEntry for DirEntry<'inj> {
-    type Metadata = mem::Metadata;
+impl fmt::Debug for DirEntry {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "DirEntry {{ inner: {:?} }}", &self.inner)
+    }
+}
+
+impl fs::DirEntry for DirEntry {
+    type Metadata = Metadata;
     type FileType = mem::FileType;
 
     fn path(&self) -> PathBuf {
@@ -262,18 +145,23 @@ impl<'inj> fs::DirEntry for DirEntry<'inj> {
     }
     fn metadata(&self) -> Result<Self::Metadata> {
         let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::DirEntry(AtDirEntry::Metadata(self)))) {
+               .map(|f| f(In::DirEntryMetadata(self))) {
             r?;
         }
-        self.inner.metadata()
+        Ok(Metadata {
+            injector: self.injector.clone(),
+            inner: self.inner.metadata()?,
+        })
     }
     fn file_type(&self) -> Result<Self::FileType> {
         let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::DirEntry(AtDirEntry::FileType(self)))) {
+               .map(|f| f(In::DirEntryFileType(self))) {
             r?;
         }
         self.inner.file_type()
@@ -291,66 +179,242 @@ impl<'inj> fs::DirEntry for DirEntry<'inj> {
 /// [`mem::File`]: ../mem/struct.File.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct File<'inj> {
-    injector: InjectFn<'inj>,
-    file_injector: InjectFilePartialFn<'inj>,
+pub struct File {
+    injector: InjectFn,
+    file_injector: InjectFilePartialFn,
     inner: mem::File,
 }
 
-impl<'inj> fs::File for File<'inj> {
-    type Metadata = mem::Metadata;
-
-    fn metadata(&self) -> Result<Self::Metadata> {
-        let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
-               .as_mut()
-               .map(|f| f(In::File(AtFile::Metadata(self)))) {
-            r?;
-        }
-        self.inner.metadata()
+impl fmt::Debug for File {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "File {{ inner: {:?} }}", &self.inner)
     }
 }
 
-impl<'inj> Read for File<'inj> {
+impl fs::File for File {
+    type Metadata = Metadata;
+    type Permissions = mem::Permissions;
+
+    fn sync_all(&self) -> Result<()> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FileSyncAll(self))) {
+            r?;
+        }
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> Result<()> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FileSyncData(self))) {
+            r?;
+        }
+        self.inner.sync_data()
+    }
+    fn set_len(&self, size: u64) -> Result<()> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FileSetLen(self, size))) {
+            r?;
+        }
+        self.inner.set_len(size)
+    }
+    fn metadata(&self) -> Result<Self::Metadata> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FileMetadata(self))) {
+            r?;
+        }
+        Ok(Metadata {
+            injector: self.injector.clone(),
+            inner: self.inner.metadata()?,
+        })
+    }
+    fn try_clone(&self) -> Result<Self> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FileTryClone(self))) {
+            r?;
+        }
+        let inner = self.inner.try_clone()?;
+        Ok(File {
+            injector: self.injector.clone(),
+            file_injector: self.file_injector.clone(),
+            inner: inner,
+        })
+    }
+    fn set_permissions(&self, perm: Self::Permissions) -> Result<()> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FileSetPermissions(self, perm))) {
+            r?;
+        }
+        self.inner.set_permissions(perm)
+    }
+}
+
+impl unix_ext::FileExt for File {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let mut injector = self.file_injector.lock(); // always hold for the entire fn
+        let mut sz = buf.len();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(InFile::ReadAt(self, buf, offset))) {
+            sz = cmp::min(r?, buf.len());
+        }
+        (&self.inner).read_at(&mut buf[..sz], offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize> {
+        let mut injector = self.file_injector.lock(); // always hold for the entire fn
+        let mut sz = buf.len();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(InFile::WriteAt(self, buf, offset))) {
+            sz = cmp::min(r?, buf.len());
+        }
+        (&self.inner).write_at(&buf[..sz], offset)
+    }
+}
+
+impl Read for File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (&mut &*self).read(buf)
+    }
+}
+impl Write for File {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (&mut &*self).write(buf)
+    }
+    fn flush(&mut self) -> Result<()> {
+        (&mut &*self).flush()
+    }
+}
+impl Seek for File {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        (&mut &*self).seek(pos)
+    }
+}
+
+impl<'a> Read for &'a File {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut injector = self.file_injector.lock(); // always hold for the entire fn
         // The injector may return Ok, but that we should read a small number of bytes.
         let mut sz = buf.len();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(AtFilePartial::Read(self, buf))) {
+               .map(|f| f(InFile::Read(self, buf))) {
             sz = cmp::min(r?, buf.len());
         }
-        self.inner.read(&mut buf[..sz])
+        (&self.inner).read(&mut buf[..sz])
     }
 }
 
-impl<'inj> Write for File<'inj> {
+impl<'a> Write for &'a File {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let mut injector = self.file_injector.lock(); // always hold for the entire fn
         // The injector may return Ok, but that we should write a small number of bytes.
         let mut sz = buf.len();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(AtFilePartial::Write(self, buf))) {
+               .map(|f| f(InFile::Write(self, buf))) {
             sz = cmp::min(r?, buf.len());
         }
-        self.inner.write(&buf[..sz])
+        (&self.inner).write(&buf[..sz])
     }
     fn flush(&mut self) -> Result<()> {
-        self.inner.flush()
+        (&self.inner).flush()
     }
 }
 
-impl<'inj> Seek for File<'inj> {
+impl<'a> Seek for &'a File {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::File(AtFile::Seek(self, &pos)))) {
+               .map(|f| f(In::FileSeek(self, &pos))) {
             r?;
         }
-        self.inner.seek(pos)
+        (&self.inner).seek(pos)
+    }
+}
+
+#[derive(Clone)]
+pub struct Metadata {
+    injector: InjectFn,
+    inner: mem::Metadata,
+}
+
+impl fs::Metadata for Metadata {
+    type Permissions = mem::Permissions;
+    type FileType    = mem::FileType;
+
+    fn file_type(&self) -> Self::FileType {
+        self.inner.file_type()
+    }
+    fn is_dir(&self) -> bool {
+        self.inner.is_dir()
+    }
+    fn is_file(&self) -> bool {
+        self.inner.is_file()
+    }
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn permissions(&self) -> Self::Permissions {
+        self.inner.permissions()
+    }
+    fn modified(&self) -> Result<SystemTime> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::MetadataModified(self))) {
+            r?;
+        }
+        Ok(self.inner.modified()?)
+    }
+    fn accessed(&self) -> Result<SystemTime> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::MetadataAccessed(self))) {
+            r?;
+        }
+        Ok(self.inner.accessed()?)
+    }
+    fn created(&self) -> Result<SystemTime> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::MetadataCreated(self))) {
+            r?;
+        }
+        Ok(self.inner.created()?)
+    }
+}
+
+impl fmt::Debug for Metadata {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Metadata {{ inner: {:?} }}", &self.inner)
     }
 }
 
@@ -362,65 +426,63 @@ impl<'inj> Seek for File<'inj> {
 /// [`mem::OpenOptions`]: ../mem/struct.OpenOptions.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct OpenOptions<'inj> {
-    injector: InjectFn<'inj>,
-    file_injector: InjectFilePartialFn<'inj>,
+#[derive(Clone)]
+pub struct OpenOptions {
+    injector: InjectFn,
+    file_injector: InjectFilePartialFn,
     inner: mem::OpenOptions,
 }
 
-impl<'inj> fs::OpenOptions for OpenOptions<'inj> {
-    type File = File<'inj>;
-
-    fn read(&mut self, read: bool) -> &mut Self {
-        self.inner.read(read);
-        self
-    }
-    fn write(&mut self, write: bool) -> &mut Self {
-        self.inner.write(write);
-        self
-    }
-    fn append(&mut self, append: bool) -> &mut Self {
-        self.inner.append(append);
-        self
-    }
-    fn truncate(&mut self, truncate: bool) -> &mut Self {
-        self.inner.truncate(truncate);
-        self
-    }
-    fn create(&mut self, create: bool) -> &mut Self {
-        self.inner.create(create);
-        self
-    }
-    fn create_new(&mut self, create_new: bool) -> &mut Self {
-        self.inner.create_new(create_new);
-        self
-    }
-    fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
-        let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
-               .as_mut()
-               .map(|f| {
-                        f(In::OpenOptions(AtOpenOptions::Open(self, &path.as_ref().to_owned())))
-                    }) {
-            r?;
-        }
-
-        self.inner
-            .open(path)
-            .map(|f| {
-                     File {
-                         injector: self.injector.clone(),
-                         file_injector: self.file_injector.clone(),
-                         inner: f,
-                     }
-                 })
+impl fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "OpenOptions {{ inner: {:?} }}", &self.inner)
     }
 }
 
-impl<'inj> unix_ext::OpenOptionsExt for OpenOptions<'inj> {
+impl fs::OpenOptions for OpenOptions {
+    type File = File;
+
+    fn read(&mut self, read: bool) -> &mut Self {
+        self.inner.read(read); self
+    }
+    fn write(&mut self, write: bool) -> &mut Self {
+        self.inner.write(write); self
+    }
+    fn append(&mut self, append: bool) -> &mut Self {
+        self.inner.append(append); self
+    }
+    fn truncate(&mut self, truncate: bool) -> &mut Self {
+        self.inner.truncate(truncate); self
+    }
+    fn create(&mut self, create: bool) -> &mut Self {
+        self.inner.create(create); self
+    }
+    fn create_new(&mut self, create_new: bool) -> &mut Self {
+        self.inner.create_new(create_new); self
+    }
+    fn open<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::OpenOptionsOpen(self, &path.as_ref().to_owned()))) {
+            r?;
+        }
+
+        Ok(File {
+            injector: self.injector.clone(),
+            file_injector: self.file_injector.clone(),
+            inner: self.inner.open(path)?,
+        })
+    }
+}
+
+impl unix_ext::OpenOptionsExt for OpenOptions {
     fn mode(&mut self, mode: u32) -> &mut Self {
-        self.inner.mode(mode);
-        self
+        self.inner.mode(mode); self
+    }
+    fn custom_flags(&mut self, flags: i32) -> &mut Self {
+        self.inner.custom_flags(flags); self
     }
 }
 
@@ -432,45 +494,46 @@ impl<'inj> unix_ext::OpenOptionsExt for OpenOptions<'inj> {
 /// [`mem::ReadDir`]: ../mem/struct.ReadDir.html
 /// [`testfs`]: index.html
 /// [documentation]: index.html
-pub struct ReadDir<'inj> {
-    injector: InjectFn<'inj>,
+pub struct ReadDir {
+    injector: InjectFn,
     inner: mem::ReadDir,
 }
 
-impl<'inj> Iterator for ReadDir<'inj> {
-    type Item = Result<DirEntry<'inj>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut injector = self.injector.lock(); // always hold for the entire fn
-        if let Some(r) = injector
-               .as_mut()
-               .map(|f| f(In::ReadDir(AtReadDir::Next(self)))) {
-            if r.is_err() {
-                return Some(Err(r.unwrap_err()));
-            }
-        }
-
-        self.inner
-            .next()
-            .map(|res| {
-                     res.map(|dirent| {
-                                 DirEntry {
-                                     injector: self.injector.clone(),
-                                     inner: dirent,
-                                 }
-                             })
-                 })
+impl fmt::Debug for ReadDir {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ReadDir {{ inner: {:?} }}", &self.inner)
     }
 }
 
-type InjectFn<'inj> = Arc<Mutex<MaybeInjectFn<'inj>>>;
-type InjectFilePartialFn<'inj> = Arc<Mutex<MaybeInjectFilePartialFn<'inj>>>;
+impl Iterator for ReadDir {
+    type Item = Result<DirEntry>;
 
-pub type MaybeInjectFn<'inj> = Option<Box<&'inj mut FnMut(In) -> Result<()>>>;
-pub type MaybeInjectFilePartialFn<'inj> = Option<Box<&'inj mut FnMut(AtFilePartial)
-                                                                     -> Result<usize>>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut injector = self.injector.lock(); // always hold for the entire fn
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::ReadDirNext(self))) {
+            if r.is_err() {
+                return Some(Err(r.expect_err("is_err failed!")));
+            }
+        }
+        self.inner
+            .next()
+            .map(|res| Ok(DirEntry {
+                injector: self.injector.clone(),
+                inner: res?,
+            }))
+    }
+}
 
-/// An in memory struct that satisfies [`rsfs::FS`] and allows for injectable errors.
+type InjectFn = Arc<Mutex<MaybeInjectFn>>;
+type InjectFilePartialFn = Arc<Mutex<MaybeInjectFilePartialFn>>;
+
+pub type MaybeInjectFn = Option<Box<FnMut(In) -> Result<()> + Send>>;
+pub type MaybeInjectFilePartialFn = Option<Box<FnMut(InFile) -> Result<usize> + Send>>;
+
+/// An in-memory struct that satisfies [`rsfs::FS`] and allows for injectable errors.
 ///
 /// `FS` is thread safe and copyable. It wraps [`mem::FS`] with an ability to inject errors. This
 /// should be generally useful for triggering error conditions in your code that generally are
@@ -482,20 +545,26 @@ pub type MaybeInjectFilePartialFn<'inj> = Option<Box<&'inj mut FnMut(AtFileParti
 /// [`mem::FS`]: ../mem/struct.FS.html
 /// [documentation]: index.html
 #[derive(Clone)]
-pub struct FS<'inj> {
-    injector: InjectFn<'inj>,
-    file_injector: InjectFilePartialFn<'inj>,
+pub struct FS {
+    injector: InjectFn,
+    file_injector: InjectFilePartialFn,
     inner: mem::FS,
 }
 
-impl<'inj> FS<'inj> {
+impl fmt::Debug for FS {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "FS {{ inner: {:?} }}", &self.inner)
+    }
+}
+
+impl FS {
     /// Creates an empty `FS` with mode `0o777`.
-    pub fn new() -> FS<'inj> {
+    pub fn new() -> FS {
         Self::with_mode(0o777)
     }
 
     /// Creates an empty `FS` with the given mode.
-    pub fn with_mode(mode: u32) -> FS<'inj> {
+    pub fn with_mode(mode: u32) -> FS {
         FS {
             injector: Arc::new(Mutex::new(None)),
             file_injector: Arc::new(Mutex::new(None)),
@@ -503,63 +572,124 @@ impl<'inj> FS<'inj> {
         }
     }
 
-    /// Changes the current working directory of the filesytsem.
-    ///
-    /// This call simply calls [`cd`] on the wrapped [`mem::FS`]. Because this is a function whose
-    /// intent is only to setup a test filesystem, it is not possible to inject errors into this
-    /// call.
-    ///
-    /// [`cd`]: ../mem/struct.FS.html#method.cd
-    /// [`mem::FS`]: ../mem/struct.FS.html
-    pub fn cd<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.inner.cd(path)
-    }
-
-    pub fn set_inject_fn(&mut self, f: MaybeInjectFn<'inj>) {
+    pub fn set_inject_fn(&mut self, f: MaybeInjectFn) {
         *self.injector.lock() = f
     }
 
-    pub fn set_inject_file_partial_fn(&mut self, f: MaybeInjectFilePartialFn<'inj>) {
+    pub fn set_inject_file_partial_fn(&mut self, f: MaybeInjectFilePartialFn) {
         *self.file_injector.lock() = f
     }
 }
 
-impl<'inj> fs::GenFS for FS<'inj> {
-    type DirBuilder = DirBuilder<'inj>;
-    type DirEntry = DirEntry<'inj>;
-    type Metadata = mem::Metadata;
-    type OpenOptions = OpenOptions<'inj>;
+impl fs::GenFS for FS {
+    type DirBuilder = DirBuilder;
+    type DirEntry = DirEntry;
+    type Metadata = Metadata;
+    type OpenOptions = OpenOptions;
     type Permissions = mem::Permissions;
-    type ReadDir = ReadDir<'inj>;
+    type ReadDir = ReadDir;
+    type File = File;
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<mem::Metadata> {
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
         let mut injector = self.injector.lock();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::FS(AtFS::Metadata(&path.as_ref().to_owned())))) {
+               .map(|f| f(In::FSCanonicalize(&path.as_ref().to_owned()))) {
             r?
         }
-        self.inner.metadata(path)
+        self.inner.canonicalize(path)
     }
 
-    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir<'inj>> {
+    fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
         let mut injector = self.injector.lock();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::FS(AtFS::ReadDir(&path.as_ref().to_owned())))) {
+               .map(|f| f(In::FSCopy(&from.as_ref().to_owned(), &to.as_ref().to_owned()))) {
+            r?
+        }
+        self.inner.copy(from, to)
+    }
+
+    fn create_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSCreateDir(&path.as_ref().to_owned()))) {
+            r?
+        }
+        self.inner.create_dir(path)
+    }
+
+    fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSCreateDirAll(&path.as_ref().to_owned()))) {
+            r?
+        }
+        self.inner.create_dir_all(path)
+    }
+
+    fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSHardLink(&src.as_ref().to_owned(), &dst.as_ref().to_owned()))) {
+            r?
+        }
+        self.inner.hard_link(src, dst)
+    }
+
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSMetadata(&path.as_ref().to_owned()))) {
+            r?
+        }
+        Ok(Metadata {
+            injector: self.injector.clone(),
+            inner: self.inner.metadata(path)?,
+        })
+    }
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<ReadDir> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSReadDir(&path.as_ref().to_owned()))) {
             r?
         }
         Ok(ReadDir {
-               injector: self.injector.clone(),
-               inner: self.inner.read_dir(path)?,
-           })
+            injector: self.injector.clone(),
+            inner: self.inner.read_dir(path)?,
+        })
+    }
+
+    fn read_link<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSReadLink(&path.as_ref().to_owned()))) {
+            r?
+        }
+        self.inner.read_link(path)
     }
 
     fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut injector = self.injector.lock();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::FS(AtFS::RemoveDir(&path.as_ref().to_owned())))) {
+               .map(|f| f(In::FSRemoveDir(&path.as_ref().to_owned()))) {
             r?
         }
         self.inner.remove_dir(path)
@@ -567,128 +697,193 @@ impl<'inj> fs::GenFS for FS<'inj> {
 
     fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut injector = self.injector.lock();
-        if let Some(r) = injector
-                         .as_mut()
-                         .map(|f| {
-                             f(In::FS(AtFS::RemoveDirAll(
-                                         &path.as_ref().to_owned())))
-                         }) {
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FSRemoveDirAll(&path.as_ref().to_owned()))) {
             r?
         }
         self.inner.remove_dir_all(path)
     }
+
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut injector = self.injector.lock();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| f(In::FS(AtFS::RemoveFile(&path.as_ref().to_owned())))) {
+               .map(|f| f(In::FSRemoveFile(&path.as_ref().to_owned()))) {
             r?
         }
         self.inner.remove_file(path)
     }
+
     fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<()> {
         let mut injector = self.injector.lock();
-        if let Some(r) = injector
+        if let Some(r) =
+            injector
                .as_mut()
-               .map(|f| {
-                        f(In::FS(AtFS::Rename(&from.as_ref().to_owned(),
-                                                  &to.as_ref().to_owned())))
-                    }) {
+               .map(|f| f(In::FSRename(&from.as_ref().to_owned(), &to.as_ref().to_owned()))) {
             r?
         }
         self.inner.rename(from, to)
     }
+
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Self::Permissions) -> Result<()> {
         let mut injector = self.injector.lock();
         if let Some(r) =
             injector
                 .as_mut()
-                .map(|f| f(In::FS(AtFS::SetPermissions(&path.as_ref().to_owned(), &perm)))) {
+                .map(|f| f(In::FSSetPermissions(&path.as_ref().to_owned(), &perm))) {
             r?
         }
         self.inner.set_permissions(path, perm)
     }
-    fn new_openopts(&self) -> OpenOptions<'inj> {
+
+    fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+               .as_mut()
+               .map(|f| f(In::FSSymlinkMetadata(&path.as_ref().to_owned()))) {
+            r?
+        }
+        Ok(Metadata {
+            injector: self.injector.clone(),
+            inner: self.inner.symlink_metadata(path)?,
+        })
+    }
+
+    fn new_openopts(&self) -> OpenOptions {
         OpenOptions {
             injector: self.injector.clone(),
             file_injector: self.file_injector.clone(),
             inner: self.inner.new_openopts(),
         }
     }
-    fn new_dirbuilder(&self) -> DirBuilder<'inj> {
+
+    fn new_dirbuilder(&self) -> DirBuilder {
         DirBuilder {
             injector: self.injector.clone(),
             inner: self.inner.new_dirbuilder(),
         }
     }
+
+    fn open_file<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FSOpenFile(&path.as_ref().to_owned()))) {
+            r?
+        }
+        Ok(File {
+            injector: self.injector.clone(),
+            file_injector: self.file_injector.clone(),
+            inner: self.inner.open_file(path)?,
+        })
+    }
+
+    fn create_file<P: AsRef<Path>>(&self, path: P) -> Result<Self::File> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FSCreateFile(&path.as_ref().to_owned()))) {
+            r?
+        }
+        Ok(File {
+            injector: self.injector.clone(),
+            file_injector: self.file_injector.clone(),
+            inner: self.inner.create_file(path)?,
+        })
+    }
 }
 
-// #[cfg(test)]
-// mod test {
-// use super::*;
-// use errors::*;
-// use fs::{DirBuilder, GenFS, OpenOptions};
-// use std::io::{Error, Read, Seek, SeekFrom, Write};
-// use unix_ext::*;
-//
-// fn errs_eq(l: Error, r: Error) -> bool {
-// l.raw_os_error() == r.raw_os_error()
-// }
-//
-// #[test]
-// fn basic() {
-// let fs = FS::with_mode(0o300);
-// assert!(fs.new_dirbuilder().mode(0o700).recursive(true).create("a/b/c").is_ok());
-//
-// Push a few errors (rustfmt makes this hideous)...
-// fs.push_sequence(vec![// Fail creating a directory...
-// Box::new(|k: In| -> Option<Result<()>> {
-// match k {
-// In::DirBuilder(AtDirBuilder::Create) => {
-// Some(Err(ENOENT()))
-// }
-// _ => None,
-// }
-// }),
-// After which, one read must succeed.
-// Box::new(|k: In| -> Option<Result<()>> {
-// match k {
-// In::File(AtFile::Read) => Some(Ok(())),
-// _ => None,
-// }
-// }),
-// Then fail the next read.
-// Box::new(|k: In| -> Option<Result<()>> {
-// match k {
-// In::File(AtFile::Read) => Some(Err(EACCES())),
-// _ => None,
-// }
-// })]);
-//
-// open a file, write some content...
-// let mut wf =
-// fs.new_openopts().mode(0o600).write(true).create_new(true).open("a/f").unwrap();
-// assert_eq!(wf.write(vec![0, 1, 2, 3, 4, 5].as_slice()).unwrap(), 6);
-//
-// open the file for reading, read some content...
-// let mut rf = fs.new_openopts().read(true).open("a/f").unwrap();
-// assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-//
-// let mut output = [0u8; 4];
-// assert_eq!(rf.read(&mut output).unwrap(), 4);
-// assert_eq!(&output, &[1, 2, 3, 4]);
-//
-// intermix consuming the errors with non-failures.
-// assert!(errs_eq(fs.new_dirbuilder().create("a/d").unwrap_err(), ENOENT())); // error 1
-// assert!(fs.new_dirbuilder().create("a/d").is_ok());
-// assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
-// assert_eq!(rf.read(&mut output).unwrap(), 4); // ok 2
-// assert_eq!(&output, &[1, 2, 3, 4]);
-// assert_eq!(rf.seek(SeekFrom::Start(2)).unwrap(), 2);
-// assert!(errs_eq(rf.read(&mut output).unwrap_err(), EACCES())); // error 3
-// and now we are back to normal
-// assert_eq!(rf.read(&mut output).unwrap(), 4);
-// assert_eq!(&output, &[2, 3, 4, 5]);
-// }
-// }
-//
+impl unix_ext::GenFSExt for FS {
+    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> Result<()> {
+        let mut injector = self.injector.lock();
+        if let Some(r) =
+            injector
+                .as_mut()
+                .map(|f| f(In::FSSymlink(&src.as_ref().to_owned(), &dst.as_ref().to_owned()))) {
+            r?
+        }
+        Ok(self.inner.symlink(src, dst)?)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use fs::{DirBuilder, GenFS, OpenOptions};
+    use std::io::{Error, Read, Result, Seek, SeekFrom, Write};
+    use std::collections::VecDeque;
+    use super::*;
+    use errors::*;
+    use unix_ext::*;
+
+    fn errs_eq(l: Error, r: Error) -> bool {
+        l.raw_os_error() == r.raw_os_error()
+    }
+
+    #[test]
+    fn basic() {
+        let mut fs = FS::with_mode(0o300);
+        assert!(fs.create_dir_all("a/b/c").is_ok());
+        let mut wf =
+        fs.new_openopts().mode(0o600).write(true).create_new(true).open("a/f").unwrap();
+        assert_eq!(wf.write(b"hello").unwrap(), 5);
+
+        let mut rf = fs.open_file("a/f").unwrap();
+        assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
+
+        let mut output = [0u8; 4];
+        assert_eq!(rf.read(&mut output).unwrap(), 4);
+        assert_eq!(&output, b"ello");
+
+        let cascade_file = Arc::new(Mutex::new(vec![]));
+        let cf_clone = cascade_file.clone();
+        let mut cascade_fs: VecDeque<Box<FnMut(In) -> Result<()> + Send>> = VecDeque::new();
+        cascade_fs.push_back(Box::new(|_in: In| -> Result<()> {
+                if let In::DirBuilderCreate(_, pb) = _in {
+                    if pb.to_str().unwrap() == "a/d" {
+                        return Err(ENOENT())
+                    }
+                }
+                Ok(())
+            }));
+        cascade_fs.push_back(Box::new(move |_in: In| -> Result<()> {
+                cf_clone.lock().push(Box::new(|_in: InFile| -> Result<usize> {
+                    if let InFile::Write(_, buf) = _in {
+                        return Ok((buf.len() / 2))
+                    }
+                    Ok(_in.buf_len())
+                }));
+                Ok(())
+            }));
+
+        fs.set_inject_fn(Some(Box::new(move |_in: In| -> Result<()> {
+            match cascade_fs.pop_front() {
+                Some(mut f) => f(_in),
+                None => Ok(()),
+            }
+        })));
+        fs.set_inject_file_partial_fn(Some(Box::new(move |_in: InFile| -> Result<usize> {
+            match cascade_file.lock().pop() {
+                Some(f) => f(_in),
+                None => Ok(_in.buf_len()),
+            }
+        })));
+
+        assert!(errs_eq(fs.new_dirbuilder().create("a/d").unwrap_err(), ENOENT())); // error 1
+        assert!(fs.new_dirbuilder().create("a/d").is_ok());
+        // When redoing this entire API, it'll actually be worth it to have more tests.
+        //assert_eq!(rf.seek(SeekFrom::Start(1)).unwrap(), 1);
+        //assert_eq!(rf.read(&mut output).unwrap(), 4); // ok 2
+        //assert_eq!(&output, &[1, 2, 3, 4]);
+        //assert_eq!(rf.seek(SeekFrom::Start(2)).unwrap(), 2);
+        //assert!(errs_eq(rf.read(&mut output).unwrap_err(), EACCES())); // error 3
+        //assert_eq!(rf.read(&mut output).unwrap(), 4);
+        //assert_eq!(&output, &[2, 3, 4, 5]);
+    }
+}
+
