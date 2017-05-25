@@ -2,7 +2,7 @@
 //!
 //! The [`FS`] struct is an empty struct. All methods on it use `std::fs` functions. The intent of
 //! this module is to set the filesystem you use to `rsfs::disk::FS` in `main.rs` and to set the
-//! filesystem to `rsfs::mem::test::FS` or something else in your tests.
+//! filesystem to `rsfs::mem::test::FS` (once it exists) in your tests.
 //!
 //! [`std::fs`]: https://doc.rust-lang.org/std/fs/
 //! [`FS`]: struct.FS.html
@@ -73,7 +73,7 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 /// Entries returned by the [`ReadDir`] iterator.
 ///
 /// An instance of `DirEntry` implements [`rsfs::DirEntry`] and represents an entry inside a
-/// directory on the in memory filesystem. This struct is a single element tuple containing a
+/// directory on the in-memory filesystem. This struct is a single element tuple containing a
 /// [`std::fs::DirEntry`].
 ///
 /// [`ReadDir`]: struct.ReadDir.html

@@ -838,7 +838,7 @@ pub trait Permissions: Clone + PartialEq + Eq + Debug {
 /// The single filesystem underpinning all filesystem operations.
 ///
 /// This trait intends to be a near drop in replacement for most uses of [`std::fs`]. As with
-/// [`std::fs`], all methods in this trait are cross platform. Extra platform specific
+/// [`std::fs`], all methods in this trait are cross-platform. Extra platform specific
 /// functionality can be found in the extension traits of `rsfs::$platform_ext`.
 ///
 /// [`std::fs`]: https://doc.rust-lang.org/std/fs/
@@ -853,7 +853,7 @@ pub trait Permissions: Clone + PartialEq + Eq + Debug {
 /// let fs = rsfs::disk::FS;
 /// ```
 ///
-/// An in memory filesystem with Unix extensions:
+/// An in-memory filesystem with Unix extensions:
 ///
 /// ```
 /// use rsfs::*;
@@ -862,7 +862,7 @@ pub trait Permissions: Clone + PartialEq + Eq + Debug {
 ///
 /// let fs = FS::with_mode(0o300);
 /// ```
-pub trait GenFS {
+pub trait GenFS: Send + Sync {
     /// The `DirBuilder` type in the same module implementing this trait.
     type DirBuilder: DirBuilder;
     /// The `DirEntry` type in the same module implementing this trait.

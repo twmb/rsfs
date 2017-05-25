@@ -1,4 +1,35 @@
-//! This module provides an in memory filesystem. It is `pub use`d in `rsfs::mem`.
+//! This module provides an in-memory filesystem that follows Unix semantics.
+//!
+//! This module, when used directly, is cross-platform. This module imitates a Unix filesystem as
+//! closely as possible, meaning if you create a directory without executable permissions, you
+//! cannot do anything inside of it.
+//!
+//! # Example
+//!
+//! ```
+//! use std::io::{Read, Seek, SeekFrom, Write};
+//! use std::path::PathBuf;
+//!
+//! use rsfs::*;
+//! use rsfs::unix_ext::*;
+//! use rsfs::mem::unix::FS;
+//!
+//! let fs = FS::new();
+//! assert!(fs.create_dir_all("a/b/c").is_ok());
+//!
+//! // writing past the end of a file zero-extends to the write position
+//! let mut wf = fs.create_file("a/f").unwrap();
+//! assert_eq!(wf.write_at(b"hello", 100).unwrap(), 5);
+//!
+//! let mut rf = fs.open_file("a/f").unwrap();
+//! let mut output = [1u8; 5];
+//! assert_eq!(rf.read(&mut output).unwrap(), 5);
+//! assert_eq!(&output, &[0, 0, 0, 0, 0]);
+//!
+//! assert_eq!(rf.seek(SeekFrom::Start(100)).unwrap(), 100);
+//! assert_eq!(rf.read(&mut output).unwrap(), 5);
+//! assert_eq!(&output, b"hello");
+//! ```
 
 extern crate parking_lot;
 
@@ -32,11 +63,11 @@ const DIRLEN: usize = 4096;
 ///
 /// This builder implements [`rsfs::DirBuilder`] and supports [unix extensions].
 ///
-/// [`rsfs::DirBuilder`]: ../trait.DirBuilder.html
-/// [unix extensions]: ../unix_ext/trait.DirBuilderExt.html
+/// [`rsfs::DirBuilder`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.DirBuilder.html
+/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.DirBuilderExt.html
 ///
 /// # Examples
-/// 
+///
 /// ```
 /// # use rsfs::*;
 /// # use rsfs::mem::FS;
@@ -49,11 +80,11 @@ const DIRLEN: usize = 4096;
 /// ```
 #[derive(Clone, Debug)]
 pub struct DirBuilder {
-    // fs is what we reach inside to create our directory.
+    /// fs is what we reach inside to create our directory.
     fs: FS,
-    // recursive indicates that nested directories will be created recursively.
+    /// recursive indicates that nested directories will be created recursively.
     recursive: bool,
-    // mode is the unix mode to set on directories when creating them.
+    /// mode is the unix mode to set on directories when creating them.
     mode:      u32,
 }
 
@@ -79,9 +110,9 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 /// Entries returned by the [`ReadDir`] iterator.
 ///
 /// An instance of `DirEntry` implements [`rsfs::DirEntry`] and represents an entry inside a
-/// directory on the in memory filesystem.
+/// directory on the in-memory filesystem.
 ///
-/// [`rsfs::DirEntry`]: ../trait.DirEntry.html
+/// [`rsfs::DirEntry`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.DirEntry.html
 /// [`ReadDir`]: struct.ReadDir.html
 ///
 /// # Examples
@@ -100,13 +131,13 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 /// ```
 #[derive(Debug)]
 pub struct DirEntry {
-    // dir is the original path requested for ReadDir. We make no attempt to clean it.
+    /// dir is the original path requested for ReadDir. We make no attempt to clean it.
     dir: PathBuf,
-    // base is the name of the file/dir/symlink at this dirent. This is created when making a
-    // DirEntry, meaning we do not track if the dirent was renamed immediately after creation.
+    /// base is the name of the file/dir/symlink at this dirent. This is created when making a
+    /// DirEntry, meaning we do not track if the dirent was renamed immediately after creation.
     base: OsString,
-    // inode is the backing "inode" for this DirEntry. The metadata() and file_type() functions in
-    // std::fs actually do OS calls, meaning they work on the most up to date actual entry.
+    /// inode is the backing "inode" for this DirEntry. The metadata() and file_type() functions in
+    /// std::fs actually do OS calls, meaning they work on the most up to date actual entry.
     inode: Inode,
 }
 
@@ -133,9 +164,9 @@ impl fs::DirEntry for DirEntry {
 /// still be read from or written to, but the file will not be openable anymore.
 #[derive(Debug)]
 struct RawFile {
-    // data is the backing file data.
+    /// data is the backing file data.
     data: Vec<u8>,
-    // inode allows us to read and write the most up to date metadata.
+    /// inode allows us to read and write the most up to date metadata.
     inode: Inode,
 }
 
@@ -191,8 +222,8 @@ impl RawFile {
 ///
 /// This struct implements [`rsfs::File`] and has [unix extensions].
 ///
-/// [`rsfs::File`]: ../trait.File.html
-/// [unix extensions]: ../unix_ext/trait.FileExt.html
+/// [`rsfs::File`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.File.html
+/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.FileExt.html
 ///
 /// # Examples
 ///
@@ -209,12 +240,16 @@ impl RawFile {
 /// ```
 #[derive(Debug)]
 pub struct File {
+    /// read indicates this file view can read the underlying file.
     read:   bool,
+    /// read indicates this file view can write to the underlying file.
     write:  bool,
+    /// read indicates this file view will append to the current end of the underlying file on
+    /// every write.
     append: bool,
 
-    // cursor is wrapped in an Arc<Mutex<_>> solely to support File's probably-should-never-be-used
-    // try_clone function.
+    /// cursor is wrapped in an `Arc<Mutex<_>>` solely to support `File`s probably-never-used
+    /// `try_clone` function.
     cursor: Arc<Mutex<FileCursor>>,
 }
 
@@ -263,15 +298,20 @@ impl fs::File for File {
 }
 
 /// `FileCursor` corresponds to an actual file descriptor, which, "behind the scenes", keeps track
-/// of where we are in a file. We use a FileCursor to support File's cloning and to support
+/// of where we are in a file. We use a `FileCursor` to support File's cloning and to support
 /// implementing read/write/seek on a &'a File.
 #[derive(Debug)]
 struct FileCursor {
+    /// file is the actual underlying file. It is wrapped in an `Arc<RwLock<>>` because other file
+    /// handles can also be reading to or writing to this file.
     file: Arc<RwLock<RawFile>>,
+    /// at tracks this cursor's position in the underlying file.
     at:   usize,
 }
 
 impl FileCursor {
+    /// The backing function for `File`s `set_len`, this can function runcate or zero extend the
+    /// underlying file.
     fn set_len(&mut self, size: u64) -> Result<()> {
         let mut file = self.file.write();
         file.inode.write().times.update(MODIFIED);
@@ -293,12 +333,14 @@ impl FileCursor {
         Ok(())
     }
 
+    /// The backing function for `File`s `read`.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let n = self.file.read().read_at(self.at, buf)?;
         self.at += n;
         Ok(n)
     }
 
+    /// The backing function for `File`s `write`.
     fn write(&mut self, buf: &[u8], append: bool) -> Result<usize> {
         let mut file = self.file.write();
         if append {
@@ -309,6 +351,8 @@ impl FileCursor {
         Ok(n)
     }
 
+    /// The backing function for `File`s `seek`. While it is undefined to seek past the end of the
+    /// file, we attempt to emulate what appears to be Rust's/Unix's behavior.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let file = self.file.write();
         file.inode.write().times.update(ACCESSED);
@@ -343,24 +387,15 @@ impl FileCursor {
 
 impl Read for File {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if !self.read {
-            return Err(EBADF());
-        }
-        Ok(self.cursor.lock().read(buf)?)
+        (&mut &*self).read(buf)
     }
 }
 impl Write for File {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        if !self.write {
-            return Err(EBADF());
-        }
-        Ok(self.cursor.lock().write(buf, self.append)?)
+        (&mut &*self).write(buf)
     }
     fn flush(&mut self) -> Result<()> {
-        if !self.write {
-            return Err(EBADF());
-        }
-        Ok(())
+        (&mut &*self).flush()
     }
 }
 impl Seek for File {
@@ -369,8 +404,7 @@ impl Seek for File {
     }
 }
 
-// Now we duplicate our impls for a &'a File to mirror std::fs - this is necessary because we can
-// call mutable functions (read, write, flush, seek) on a file reference.
+// Now we actually do the impls for &'a File.
 
 impl<'a> Read for &'a File {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -419,7 +453,7 @@ impl unix_ext::FileExt for File {
     }
 }
 
-/// Ftyp is the actual underlying enum for a FileType.
+/// `Ftyp` is the actual underlying enum for a `FileType`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum Ftyp {
     File,
@@ -431,8 +465,8 @@ enum Ftyp {
 ///
 /// This structure implements [`rsfs::FileType`]
 ///
-/// [`Metadata::file_type`]: ../trait.Metadata.html#tymethod.file_type
-/// [`rsfs::FileType`]: ../trait.FileType.html
+/// [`Metadata::file_type`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.Metadata.html#tymethod.file_type
+/// [`rsfs::FileType`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.FileType.html
 ///
 /// # Examples
 ///
@@ -467,9 +501,9 @@ impl fs::FileType for FileType {
 /// [`symlink_metadata`] methods and represents known metadata information about a file at the
 /// instant in time this structure is instantiated.
 ///
-/// [`rsfs::Metadata`]: ../trait.Metadata.html
-/// [`metadata`]: ../trait.GenFS.html#tymethod.metadata
-/// [`symlink_metadata`]: ../trait.GenFS.html#tymethod.symlink_metadata
+/// [`rsfs::Metadata`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.Metadata.html
+/// [`metadata`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.metadata
+/// [`symlink_metadata`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.symlink_metadata
 ///
 /// # Examples
 ///
@@ -523,11 +557,11 @@ impl fs::Metadata for Metadata {
 ///
 /// This builder implements [`rsfs::OpenOptions`] and supports [unix extensions].
 ///
-/// [`new_openopts`]: ../trait.GenFS.html#tymethod.new_openopts
-/// [`open_file`]: ../trait.GenFS.html#tymethod.open_file
-/// [`create_file`]: ../trait.GenFS.html#tymethod.create_file
-/// [`rsfs::OpenOptions`]: ../trait.OpenOptions.html
-/// [unix extensions]: ../unix_ext/trait.OpenOptionsExt.html
+/// [`new_openopts`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.new_openopts
+/// [`open_file`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.open_file
+/// [`create_file`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.create_file
+/// [`rsfs::OpenOptions`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.OpenOptions.html
+/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.OpenOptionsExt.html
 ///
 /// # Examples
 ///
@@ -611,8 +645,8 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
 ///
 /// This struct implements [`rsfs::Permissions`] and has [unix extensions].
 ///
-/// [`rsfs::Permissions`]: ../trait.Permissions.html
-/// [unix extensions]: ../unix_ext/trait.PermissionsExt.html
+/// [`rsfs::Permissions`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.Permissions.html
+/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.PermissionsExt.html
 ///
 /// # Examples
 ///
@@ -712,7 +746,7 @@ impl Iterator for ReadDir {
     }
 }
 
-/// An in memory struct that satisfies [`rsfs::GenFS`].
+/// An in-memory struct that satisfies [`rsfs::GenFS`].
 ///
 /// `FS` is thread safe and copyable. It operates internally with an `Arc<Mutex<FileSystem>>`
 /// (`FileSystem` not being exported) and forces all filesystem calls to go through the mutex. `FS`
@@ -723,11 +757,11 @@ impl Iterator for ReadDir {
 /// See the module [documentation] or every struct's documentation for more examples of using an
 /// `FS`.
 ///
-/// [`rsfs::GenFS`]: ../trait.GenFS.html
+/// [`rsfs::GenFS`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html
 /// [documentation]: index.html
 ///
 /// # Examples
-/// 
+///
 /// ```
 /// use rsfs::*;
 /// use rsfs::mem::FS;
@@ -737,7 +771,7 @@ impl Iterator for ReadDir {
 #[derive(Clone, Debug)]
 pub struct FS(Arc<Mutex<FileSystem>>);
 
-/* The following is meant for debugging purposes when developing this library only 
+/* The following is meant for debugging purposes when developing this library only
 impl fmt::Display for FS {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let fs = self.0.lock();
@@ -835,8 +869,10 @@ impl fs::GenFS for FS {
     }
     fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Result<u64> {
         // std::fs's copy actually uses std::fs functions to implement copy, which is nice. We will
-        // repeat that pattern here. First, though, we have to validate that `from` is actually a
-        // file. We do that first and return the same std::fs error if it is not.
+        // repeat that pattern here, which requires us to use rsfs traits
+        use fs::OpenOptions;
+        use fs::File;
+        // First, though, we have to validate that `from` is actually a file.
         fn not_file() -> Error {
             Error::new(ErrorKind::InvalidInput, "the source path is not an existing regular file")
         }
@@ -868,10 +904,8 @@ impl fs::GenFS for FS {
         // copied, which really isn't a huge deal. If the race changed from to a directory, the
         // io::copy would fail, as reads on directories fail immediately.
         // (also see https://github.com/rust-lang/rust/issues/37885)
-        use fs::OpenOptions;
         let mut reader = self.new_openopts().read(true).open(from)?;
         let mut writer = self.new_openopts().write(true).truncate(true).create(true).open(to)?;
-        use fs::File;
         let perm = reader.metadata()?.permissions();
         let ret = io::copy(&mut reader, &mut writer)?;
         self.set_permissions(to, perm)?;
@@ -994,7 +1028,7 @@ impl Times {
     }
 }
 
-/// InodeData is the backing shared data of an "inode". Unix systems can have multiple files
+/// `InodeData` is the backing shared data of an "inode". Unix systems can have multiple files
 /// pointing to the same inode. We minimally mimic that in this code. We don't recreate a full unix
 /// filesystem, but the following data is shared behind a mutex when creating hard links or raw
 /// files.
@@ -1014,7 +1048,7 @@ impl PartialEq for InodeData {
     }
 }
 
-/// Inode is what makes sharing InodeData between hard links / dirents / raw files possible.
+/// `Inode` is what makes sharing `InodeData` between hard links / dirents / raw files possible.
 #[derive(Clone, Debug)]
 struct Inode(Arc<RwLock<InodeData>>);
 
@@ -1051,8 +1085,8 @@ impl Deref for Inode {
     }
 }
 
-/// DeKind differentiates between files, directories, and symlinks. It mildly duplicates
-/// information that is available in InodeData's ftyp.
+/// `DeKind` differentiates between files, directories, and symlinks. It mildly duplicates
+/// information that is available in `InodeData`s ftyp.
 #[derive(Debug)]
 enum DeKind {
     File(Arc<RwLock<RawFile>>),
@@ -1090,11 +1124,11 @@ impl DeKind {
 /// Dirent represents all information needed at a node in our filesystem tree. We use raw pointers
 /// to traverse dirents. It's "unsafe", so we have a myriad of tests ensuring it isn't.
 ///
-/// We use Raw because the real alternative is Arc<RwLock<_>> around every Dirent (inside the
-/// HashMap and inside the parent). Doing this would force a clone and a read lock on every
-/// directory traversal. After writing all FS operations using Arc/RwLock, I am not so sure that
-/// this is even safe - it's possible (and hard to reason about) that some combination of directory
-/// traversals could hold a read lock blocking a write lock.
+/// We use `Raw` because the real alternative is `Arc<RwLock<_>>` around every Dirent (inside the
+/// `HashMap` and inside the parent). Doing this would force a clone and a read lock on every
+/// directory traversal. After writing all FS operations using `Arc`/`RwLock`, I am not so sure
+/// that this is even safe - it's possible (and hard to reason about) that some combination of
+/// directory traversals could hold a read lock blocking a write lock.
 ///
 /// More importantly, having two filesystem operations occuring simultaneously is completely
 /// unsafe. Think about what would happen if we need to rename something from /a/b/c to /d/e/f at
@@ -1148,18 +1182,18 @@ impl fmt::Debug for Dirent {
     }
 }
 
-/// Pwd is the basis for traversing and modifying our filesystem. We separate it from FileSystem
-/// because we occasionally create ephemeral Pwd's on the fly, and we don't want a Pwd's Drop and
-/// invalidate our entire filesystem.
+/// `Pwd` is the basis for traversing and modifying our filesystem. We separate it from
+/// `FileSystem` because we occasionally create ephemeral `Pwd`s on the fly, and we don't want a
+/// `Pwd`s `Drop` to invalidate our entire filesystem.
 ///
 /// Recursive removes can delete the filesystem from underneath us - we can recursively remove a
-/// parent directory. We need to invalidate the filesystem when that happens. Additionally, When a
+/// parent directory. We need to invalidate the filesystem when that happens. Additionally, when a
 /// filesystem drops, we need to delete everything under root. What happens if we recursively
-/// removed root already? Pwd's `alive` covers both cases.
+/// removed root already? `Pwd`s `alive` covers both cases.
 ///
 /// If our Pwd was removed, alive is false, and all operations fail. Any time we use root, we check
-/// if Pwd is alive and, if it is not, we pointer compare root and Pwd's inner. If they are equal,
-/// root is unusable (because alive being false means Pwd's inner has been dropped).
+/// if Pwd is alive and, if it is not, we pointer compare root and `Pwd`s inner. If they are equal,
+/// root is unusable (because alive being false means `Pwd`s inner has been dropped).
 #[derive(Debug)]
 struct Pwd {
     inner: Raw<Dirent>,
@@ -1175,8 +1209,8 @@ impl From<Raw<Dirent>> for Pwd {
     }
 }
 
-/// FileSystem is a single in-memory filesystem that can be cloned and passed around safely. A
-/// single FileSystem must be unique. On drop, the entire filesystem is deleted.
+/// `FileSystem` is a single in-memory filesystem that can be cloned and passed around safely. A
+/// single `FileSystem` must be unique. On drop, the entire filesystem is deleted.
 #[derive(Debug)]
 struct FileSystem {
     // root exists for preemptive support for changing the current working directory. `cd` used to

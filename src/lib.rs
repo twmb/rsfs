@@ -1,4 +1,4 @@
-//! A generic filesystem with implementations for normal (disk), in memory, and test work sets.
+//! A generic filesystem with disk and in-memory implementations.
 //!
 //! # Reason for existence
 //!
@@ -7,29 +7,43 @@
 //! handles errors properly because generally, you are not testing on an already broken machine.
 //! You could attempt to set up FUSE, which, although doable, is involved.
 //!
-//! This crate provides a generic filesystem with various implementations, one of which is an
-//! in-memory filesystem that can have defined error injection. The intent of this crate is for you
-//! to use the generic [`rsfs::FS`] everywhere where you use `std::fs` in your code. Your `main.rs`
-//! can use [`rsfs::disk::FS`] to get default disk behavior while your tests use
-//! [`rsfs::mem::test::FS`] to get an in-memory filesystem that can have errors injected.
+//! This crate provides a generic filesystem with various implementations. At the moment, only
+//! normal (non-injectable) disk and in-memory implementations are provided. In the future, an
+//! error-injectable shim around the in-memory file system will be provided to help trigger
+//! filesystem errors in unit tests.
+//!
+//! The intent of this crate is for you to use the generic [`rsfs::GenFS`] everywhere where you use
+//! `std::fs` in your code. Your `main.rs` can use [`rsfs::disk::FS`] to get default disk behavior
+//! while your tests use `rsfs::mem::test::FS` (once it exists) to get an in-memory filesystem that
+//! can have errors injected.
 //!
 //! # An in-memory filesystem
 //!
-//! The injectable in-memory filesystem is a small shim that wraps a solid in-memory filesystem.
-//! There existed no complete in-process in-memory filesystem when I wrote this crate. I believe
-//! the implementation in [`rsfs::mem`] should suffice for most future needs.
+//! There existed no complete in-process in-memory filesystem when I wrote this crate; the
+//! implementation in [`rsfs::mem`] should suffice most needs.
+//!
+//! `rsfs::mem` is a platform specific module that `pub use`s the proper module based off the
+//! builder's platform. To get a platform agnostic module, you need to use the in-memory platform
+//! you desire. Thus, if you use [`rsfs::mem::unix`], you will get an in-memory system that follows
+//! Unix semantics. If you use `rsfs::mem::windows`, you will get an in-memory system that follows
+//! Windows semantics (however, you would have to write that module first).
+//!
+//! This means that `rsfs::mem` aims to essentially be an in-memory drop in for `std::fs` and
+//! forces you to structure your code in a cross-platform way. `rsfs::mem::unix` aims to be a Unix
+//! specific drop in that buys you Unix semantics on all platforms.
 //!
 //! # Caveats
 //!
-//! The current in-memory filesystems are only implemented for Unix. Window's users can help by
-//! implementing the in-memory analog for Windows.
+//! The current in-memory filesystems are only implemented for Unix. This means that the only
+//! cross-platform in-memory filesystem is specifically `rsfs::mem::unix`. Window's users can help
+//! by implementing the in-memory analog for Windows.
 //!
 //! The in-memory filesystem is implemented using some unsafe code. I deemed this necessary after
-//! working with the recursive data structure that is a filesystem through an Arc/RwLock for too
-//! long. The code is pretty well tested; there should be no problems. The usage of unsafe, in my
-//! opinion, makes the code much clearer, but it did require special care in some functions.
+//! working with the recursive data structure that is a filesystem through an `Arc`/`RwLock` for
+//! too long. The code is pretty well tested; there should be no problems. The usage of unsafe, in
+//! my opinion, makes the code much clearer, but it did require special care in some functions.
 //!
-//! Lastly, this crate makes use of nightly's (as of Rust 1.18) [`NonZero`] struct. Hopefully this
+//! Lastly, this crate makes use of nightly's (as of Rust 1.17) [`NonZero`] struct. Hopefully this
 //! will be stablized soon, but usage of this crate currently forces nightly.
 //!
 //! # Documentation credit
@@ -40,12 +54,10 @@
 //! attribution purposes.
 //!
 //! [`std::fs`]: https://doc.rust-lang.org/std/fs/
+//! [`rsfs::GenFS`]: trait.GenFS.html
 //! [`rsfs::disk::FS`]: disk/struct.FS.html
-//! [`rsfs::mem::test::FS`]: mem/test/struct.FS.html
 //! [`rsfs::mem`]: mem/index.html
-//! [`rsfs::FS`]: trait.FS.html
-//! [`rsfs::rs`]: rs/index.html
-//! [`rsfs::testfs`]: testfs/index.html
+//! [`rsfs::mem::unix`]: mem/unix/index.html
 //! [`NonZero`]: https://doc.rust-lang.org/core/nonzero/struct.NonZero.html
 
 #![feature(const_fn)]
@@ -54,11 +66,9 @@
 mod fs;
 pub use fs::*;
 
-#[cfg(unix)]
-pub mod unix_ext;
-
 pub mod disk;
 pub mod mem;
+pub mod unix_ext;
 
 mod errors;
 mod path_parts;
