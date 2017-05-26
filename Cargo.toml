@@ -1,10 +1,9 @@
 [package]
 name = "rsfs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Travis Bischel <travis.bischel@gmail.com>"]
 description = "A generic filesystem with disk and in-memory implementations."
 documentation = "https://docs.rs/rsfs"
-homepage = "https://docs.rs/rsfs"
 repository = "https://github.com/twmb/rsfs"
 readme = "README.md"
 keywords = ["filesystem", "fs", "memory", "testing", "test"]
