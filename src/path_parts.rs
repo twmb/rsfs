@@ -6,7 +6,7 @@
 //! [`std::path::Path`]: https://doc.rust-lang.org/std/path/struct.Path.html
 
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 /// An iterator with `peek()` and `peek2()` calls that return optional references to the next
 /// element or the one after.
