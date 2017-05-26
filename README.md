@@ -1,7 +1,7 @@
 rsfs
 ====
 
-[![Build Status](https://travis-ci.org/twmb/rsfs.svg?branch=master)](https://travis-ci.org/twmb/rsfs)  [![Crates.io](https://img.shields.io/crates/v/rsfs.svg)](https://crates.io/crates/rsfs) [![Documentation](https://docs.rs/rsfs/badge.svg)](https://docs.rs/rsfs/badge.svg)
+[![Build Status](https://travis-ci.org/twmb/rsfs.svg?branch=master)](https://travis-ci.org/twmb/rsfs)  [![Crates.io](https://img.shields.io/crates/v/rsfs.svg)](https://crates.io/crates/rsfs) [![Documentation](https://docs.rs/rsfs/badge.svg)](https://docs.rs/rsfs/)
 
 
 This crate provides a generic filesystem with disk and in-memory
