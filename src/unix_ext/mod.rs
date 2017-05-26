@@ -1,7 +1,7 @@
 //! Unix specific traits that extend the traits in [`rsfs`].
 //!
-//! This module is only available on Unix systems. These traits are separate from `rsfs` traits to
-//! ensure users of these traits opt-in to Unix specific functionality.
+//! These traits are separate from `rsfs` traits to ensure users of these traits opt-in to Unix
+//! specific functionality.
 //!
 //! # Examples
 //!
