@@ -21,11 +21,11 @@ impl<T: ?Sized> Raw<T> {
     }
 
     pub fn ptr(&self) -> *mut T {
-        unsafe { mem::transmute(*self.ptr) }
+        unsafe { mem::transmute(self.ptr.get()) }
     }
 
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        *this.ptr == *other.ptr
+        this.ptr.get() == other.ptr.get()
     }
 }
 
@@ -45,7 +45,7 @@ impl<T: ?Sized> Deref for Raw<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        unsafe { &**self.ptr }
+        unsafe { &*self.ptr.get() }
     }
 }
 
@@ -53,12 +53,6 @@ impl<T: ?Sized> DerefMut for Raw<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.ptr() }
-    }
-}
-
-impl<T> fmt::Pointer for Raw<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Pointer::fmt(&*self.ptr, f)
     }
 }
 
