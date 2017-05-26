@@ -139,28 +139,9 @@ pub struct Parts {
     pub inner: Vec<Part>,
 }
 
-impl Default for Parts {
-    fn default() -> Parts {
-        Parts { at_root: false, inner: vec![] }
-    }
-}
-
 impl From<Part> for Parts {
     fn from(p: Part) -> Parts {
         Parts { at_root: false, inner: vec![p] }
-    }
-}
-
-impl From<Parts> for PathBuf {
-    fn from(ps: Parts) -> PathBuf {
-        let mut b = PathBuf::new();
-        for p in ps.inner {
-            match p {
-                Part::ParentDir => b.push(".."),
-                Part::Normal(n) => b.push(n),
-            }
-        }
-        b
     }
 }
 
