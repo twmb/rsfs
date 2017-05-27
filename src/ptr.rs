@@ -1,6 +1,5 @@
 extern crate core;
 
-use self::core::nonzero::NonZero;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -11,21 +10,21 @@ use std::ops::{Deref, DerefMut};
 /// it very easy to work with `*mut T` by implementing `Deref` and `DerefMut` with their targets
 /// being &T and `&mut T`.
 pub struct Raw<T: ?Sized> {
-    ptr: NonZero<*const T>,
+    ptr: *const T, // TODO once NonZero is stable, wrap w/ NonZero
     mkr: PhantomData<T>,
 }
 
 impl<T: ?Sized> Raw<T> {
-    pub const fn new(ptr: *mut T) -> Raw<T> {
-        unsafe { Raw { ptr: NonZero::new(ptr), mkr: PhantomData } }
+    pub fn new(ptr: *mut T) -> Raw<T> {
+        Raw { ptr: ptr, mkr: PhantomData }
     }
 
     pub fn ptr(&self) -> *mut T {
-        unsafe { mem::transmute(self.ptr.get()) }
+        unsafe { mem::transmute(self.ptr) }
     }
 
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.get() == other.ptr.get()
+        this.ptr == other.ptr
     }
 }
 
@@ -45,7 +44,7 @@ impl<T: ?Sized> Deref for Raw<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        unsafe { &*self.ptr.get() }
+        unsafe { &*self.ptr }
     }
 }
 

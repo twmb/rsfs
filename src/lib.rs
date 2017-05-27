@@ -43,9 +43,6 @@
 //! too long. The code is pretty well tested; there should be no problems. The usage of unsafe, in
 //! my opinion, makes the code much clearer, but it did require special care in some functions.
 //!
-//! Lastly, this crate makes use of nightly's (as of Rust 1.17) [`NonZero`] struct. Hopefully this
-//! will be stablized soon, but usage of this crate currently forces nightly.
-//!
 //! # Documentation credit
 //!
 //! This crate copies _a lot_ of the documentation and examples that currently exist in `std::fs`.
@@ -58,10 +55,6 @@
 //! [`rsfs::disk::FS`]: disk/struct.FS.html
 //! [`rsfs::mem`]: mem/index.html
 //! [`rsfs::mem::unix`]: mem/unix/index.html
-//! [`NonZero`]: https://doc.rust-lang.org/core/nonzero/struct.NonZero.html
-
-#![feature(const_fn)]
-#![feature(nonzero)]
 
 mod fs;
 pub use fs::*;
