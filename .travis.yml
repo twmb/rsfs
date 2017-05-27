@@ -6,10 +6,5 @@ rust:
   - beta
   - nightly
 
-matrix:
-  allow_failures:
-    - rust: stable
-    - rust: beta
-
 notifications:
   email: false
