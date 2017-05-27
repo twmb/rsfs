@@ -63,8 +63,8 @@ const DIRLEN: usize = 4096;
 ///
 /// This builder implements [`rsfs::DirBuilder`] and supports [unix extensions].
 ///
-/// [`rsfs::DirBuilder`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.DirBuilder.html
-/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.DirBuilderExt.html
+/// [`rsfs::DirBuilder`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.DirBuilder.html
+/// [unix extensions]: https://docs.rs/rsfs/0.4.1/rsfs/unix_ext/trait.DirBuilderExt.html
 ///
 /// # Examples
 ///
@@ -112,7 +112,7 @@ impl unix_ext::DirBuilderExt for DirBuilder {
 /// An instance of `DirEntry` implements [`rsfs::DirEntry`] and represents an entry inside a
 /// directory on the in-memory filesystem.
 ///
-/// [`rsfs::DirEntry`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.DirEntry.html
+/// [`rsfs::DirEntry`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.DirEntry.html
 /// [`ReadDir`]: struct.ReadDir.html
 ///
 /// # Examples
@@ -222,8 +222,8 @@ impl RawFile {
 ///
 /// This struct implements [`rsfs::File`] and has [unix extensions].
 ///
-/// [`rsfs::File`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.File.html
-/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.FileExt.html
+/// [`rsfs::File`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.File.html
+/// [unix extensions]: https://docs.rs/rsfs/0.4.1/rsfs/unix_ext/trait.FileExt.html
 ///
 /// # Examples
 ///
@@ -465,8 +465,8 @@ enum Ftyp {
 ///
 /// This structure implements [`rsfs::FileType`]
 ///
-/// [`Metadata::file_type`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.Metadata.html#tymethod.file_type
-/// [`rsfs::FileType`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.FileType.html
+/// [`Metadata::file_type`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.Metadata.html#tymethod.file_type
+/// [`rsfs::FileType`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.FileType.html
 ///
 /// # Examples
 ///
@@ -501,9 +501,9 @@ impl fs::FileType for FileType {
 /// [`symlink_metadata`] methods and represents known metadata information about a file at the
 /// instant in time this structure is instantiated.
 ///
-/// [`rsfs::Metadata`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.Metadata.html
-/// [`metadata`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.metadata
-/// [`symlink_metadata`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.symlink_metadata
+/// [`rsfs::Metadata`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.Metadata.html
+/// [`metadata`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.GenFS.html#tymethod.metadata
+/// [`symlink_metadata`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.GenFS.html#tymethod.symlink_metadata
 ///
 /// # Examples
 ///
@@ -557,11 +557,11 @@ impl fs::Metadata for Metadata {
 ///
 /// This builder implements [`rsfs::OpenOptions`] and supports [unix extensions].
 ///
-/// [`new_openopts`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.new_openopts
-/// [`open_file`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.open_file
-/// [`create_file`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html#tymethod.create_file
-/// [`rsfs::OpenOptions`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.OpenOptions.html
-/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.OpenOptionsExt.html
+/// [`new_openopts`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.GenFS.html#tymethod.new_openopts
+/// [`open_file`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.GenFS.html#tymethod.open_file
+/// [`create_file`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.GenFS.html#tymethod.create_file
+/// [`rsfs::OpenOptions`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.OpenOptions.html
+/// [unix extensions]: https://docs.rs/rsfs/0.4.1/rsfs/unix_ext/trait.OpenOptionsExt.html
 ///
 /// # Examples
 ///
@@ -645,8 +645,8 @@ impl unix_ext::OpenOptionsExt for OpenOptions {
 ///
 /// This struct implements [`rsfs::Permissions`] and has [unix extensions].
 ///
-/// [`rsfs::Permissions`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.Permissions.html
-/// [unix extensions]: https://docs.rs/rsfs/0.2.0/rsfs/unix_ext/trait.PermissionsExt.html
+/// [`rsfs::Permissions`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.Permissions.html
+/// [unix extensions]: https://docs.rs/rsfs/0.4.1/rsfs/unix_ext/trait.PermissionsExt.html
 ///
 /// # Examples
 ///
@@ -757,7 +757,7 @@ impl Iterator for ReadDir {
 /// See the module [documentation] or every struct's documentation for more examples of using an
 /// `FS`.
 ///
-/// [`rsfs::GenFS`]: https://docs.rs/rsfs/0.2.0/rsfs/trait.GenFS.html
+/// [`rsfs::GenFS`]: https://docs.rs/rsfs/0.4.1/rsfs/trait.GenFS.html
 /// [documentation]: index.html
 ///
 /// # Examples
