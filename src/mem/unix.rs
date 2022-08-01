@@ -330,6 +330,7 @@ impl FileCursor {
             // If equal, we get to do nothing.
             _ => (),
         }
+        file.inode.write().length = file.data.len();
         Ok(())
     }
 
